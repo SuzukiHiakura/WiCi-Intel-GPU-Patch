@@ -2,37 +2,91 @@ Developed with GPT Sol 6.1
 
 # WiCi/InferSSD Intel GPU patch
 
-**Functional on the tested Intel Arc Pro B70 with GPT-OSS120B and DeepSeek V4.1 Flash1017.**
+**Functional on the tested Intel Arc Pro B70 with GPT-OSS 120B and DeepSeek V4.1 Flash 1017.**
 
-This project provides the Intel/B70 Windows Vulkan patch for WiCi/InferSSD and the DeepSeek compatibility layer used for the recorded functional proof.
+This project adds Intel GPU support to WiCi/InferSSD on Windows through Vulkan. Both models produced coherent responses in measured runs on the B70.
 
-## B70 functional test results
+SSD expert streaming limits resident GPU-memory use. Slow generation is the tradeoff; the measured speed and memory use are shown below.
 
-The purpose is large-model functionality with a small resident GPU-memory footprint through SSD expert streaming. Throughput is documented as the tradeoff. Both models produced coherent replies through WiCi/InferSSD on the B70.
+## B70 test results
 
-| Tested model | Input / output tokens | Total time | Prefill | Avg / low / peak tokens/s | Peak sampled local VRAM |
-|---|---:|---:|---:|---:|---:|
-| GPT-OSS 120B | 273 /512 | 27.4 min | 5.4 min | 0.3906 / 0.2526 / 0.8206 | 6.21 GiB |
-| DeepSeek V4.1 Flash 1017 (mixed quantization) | 211 /512 | 69.2 min | 20.5 min | 0.1761 / 0.1531 / 0.1867 | 10.75 GiB |
+| Model | Input tokens | Output tokens | Total run time | Prompt processing |
+|---|---:|---:|---:|---:|
+| GPT-OSS 120B | 273 | 512 | 27.4 min | 5.4 min |
+| DeepSeek V4.1 Flash 1017 | 211 | 512 | 69.2 min | 20.5 min |
 
-GPT host/GPU expert caches:512MiB/2GiB. DeepSeek:8MiB/64MiB. Whole-system RAM load peaked at44%/57%, respectively, on the64GiB system, with other applications running. DeepSeek sampled native private commit peaked at11.93GiB; private commit, resident RAM and VRAM are separate measures.
+Total run time includes startup and prompt processing. Prompt processing, also called **prefill**, is the input-processing stage before generation.
 
-Decode rates exclude startup, prefill, first token and EOS; model control/reasoning tokens are included. Different tokenizers and cache budgets mean this is not a controlled speed ranking. Full computer/transfer counters: [BENCHMARKS.md](BENCHMARKS.md) and [BENCHMARK.json](BENCHMARK.json).
+### Generation speed
+
+| Model | Average (tokens/s) | Lowest recorded (tokens/s) | Highest recorded (tokens/s) |
+|---|---:|---:|---:|
+| GPT-OSS 120B | 0.3906 | 0.2526 | 0.8206 |
+| DeepSeek V4.1 Flash 1017 | 0.1761 | 0.1531 | 0.1867 |
+
+These are decode speeds: they exclude startup, prefill, the first token and end-of-sequence (EOS). Model control and reasoning tokens are included.
+
+These runs used different tokenizers, cache budgets and backend versions, so they are not a controlled speed comparison.
+
+### Memory and cache settings
+
+| Memory setting or measurement | GPT-OSS 120B | DeepSeek V4.1 Flash 1017 |
+|---|---:|---:|
+| Configured host expert cache | 512 MiB | 8 MiB |
+| Configured GPU expert cache | 2 GiB | 64 MiB |
+| Peak sampled process VRAM | 6.21 GiB | 10.75 GiB |
+| Peak whole-system RAM load | 44% | 57% |
+
+The computer had **64 GiB of RAM**, and other applications were running. Whole-system RAM load includes those applications. The cache settings are budgets, not total model memory use.
+
+DeepSeek's sampled native private commit peaked at **11.93 GiB**. Private commit measures committed process memory; it is separate from resident RAM and VRAM. Peak sampled process VRAM is the highest observed local GPU-memory use for the process.
+
+Full measurements: [benchmark report](BENCHMARKS.md) and [raw benchmark data](BENCHMARK.json).
 
 ## Models used
 
-- **DeepSeek-V4.1-Flash-1017**, architecture `deepseek41`: ten-shard GGUF named `DeepSeek-V4.1-Flash-1017-Q8_0-00001-of-00010.gguf` through `00010`. This is mixed quantization, with native MXFP4 routed experts rather than an entirely8-bit model. [Matching GGUF files](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/Q8_0) · [base model](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017).
-- **GPT-OSS120B Derestricted**, tested file `gpt-oss-120b-Derestricted.MXFP4_MOE.gguf`. [Recorded quantizer repository](https://huggingface.co/mradermacher/gpt-oss-120b-Derestricted-GGUF) · [matching single-file listing](https://huggingface.co/gghfez/gpt-oss-120b-Derestricted.MXFP4_MOE-gguf) · [fine-tune source](https://huggingface.co/ArliAI/gpt-oss-120b-Derestricted) · [base model](https://huggingface.co/openai/gpt-oss-120b).
+### DeepSeek V4.1 Flash 1017
 
-The links were checked on November17,2026. The original model files were held and version-checked during testing. The GPT file previously matched its recorded published LFS SHA256 and size; DeepSeek was header/version/custody-bound without a full payload checksum comparison. This does not claim publisher authenticity. Weights are obtained from their publishers and retain their own licenses.
+- **Version:** DeepSeek-V4.1-Flash-1017, architecture `deepseek41`.
+- **Files:** Ten GGUF shards, from `DeepSeek-V4.1-Flash-1017-Q8_0-00001-of-00010.gguf` through `00010`.
+- **Quantization:** A mixed distribution with native MXFP4 expert weights. The Q8_0 filename does not mean every weight is 8-bit.
+- **Downloads:** [Matching GGUF files](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/Q8_0).
+- **Source:** [DeepSeek base model](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017).
+
+### GPT-OSS 120B Derestricted
+
+- **Tested file:** `gpt-oss-120b-Derestricted.MXFP4_MOE.gguf`.
+- **Downloads:** [Matching single-file listing](https://huggingface.co/gghfez/gpt-oss-120b-Derestricted.MXFP4_MOE-gguf) and [recorded quantizer repository](https://huggingface.co/mradermacher/gpt-oss-120b-Derestricted-GGUF).
+- **Sources:** [Derestricted fine-tune](https://huggingface.co/ArliAI/gpt-oss-120b-Derestricted) and [OpenAI base model](https://huggingface.co/openai/gpt-oss-120b).
+
+Links were checked on **November 17, 2026**. Model weights are downloaded separately and retain their publishers' licenses.
+
+### Model-file verification
+
+- **GPT:** The file previously matched the recorded published LFS SHA-256 checksum and file size.
+- **DeepSeek:** Files were checked by their headers and versions and tracked through testing. A full payload checksum comparison was not performed.
+
+These checks describe file identity, not a guarantee of publisher authenticity.
 
 ## Tested computer
 
-Windows10 Education22H2, build **19045.6456**,64-bit; MSI **Z390-A PRO(MS-7B98)**; Intel **Core i7-8700K**,6cores/12threads at3.70GHz; **2×32GiB RAM**, configured3200MHz; **Intel Arc Pro B70**, driver **32.0.101.8976**. The neural path used the B70/Vulkan F32 route. Intel UHD630 was also enumerated. [Hardware inventory](HARDWARE.json).
+| Component | Tested configuration |
+|---|---|
+| Operating system | Windows 10 Education 22H2, 64-bit; build **19045.6456** |
+| Motherboard | MSI Z390-A PRO (MS-7B98) |
+| Processor | Intel Core i7-8700K; 6 cores / 12 threads; 3.70 GHz |
+| Memory | 64 GiB: 2 × 32 GiB; configured at 3200 MHz |
+| Inference GPU | Intel Arc Pro B70 |
+| GPU driver | 32.0.101.8976 |
+| Inference backend | Vulkan, F32 neural path |
+
+Intel UHD 630 was also detected. Inference used the B70 exclusively. See the [hardware inventory](HARDWARE.json) for the recorded details.
 
 ## Original recipe prompt and recorded responses
 
-**Both replies were cut off by the local benchmark's512-output-token limit. Neither model reached EOS before that cap. This cutoff is a test setting, not an inference failure.** The successful result is coherent generated text through the Intel GPU backend; complete recipes and cooking accuracy were not separately evaluated.
+**Both runs generated 512 output tokens and stopped at the benchmark's local limit before EOS.** The cutoff was a test setting, not an inference failure or the models' maximum reply length.
+
+The saved replies are therefore incomplete. Recipe completeness and cooking accuracy were not evaluated.
 
 <details>
 <summary>Original user prompt</summary>
@@ -46,7 +100,7 @@ I wanted you to share with me a recipe of a chicken pot pie. Mine usually uses a
 </details>
 
 <details>
-<summary>GPT-OSS120B response</summary>
+<summary>GPT-OSS 120B response</summary>
 
 ````text
 ## Quick‑&‑Easy Chicken Pot‑Pie (≈ 1 hour total)
@@ -96,7 +150,7 @@ The trick is to use a **store‑bought flaky crust**, **pre‑cooked rotisserie 
 </details>
 
 <details>
-<summary>DeepSeek V4.1 Flash1017 response</summary>
+<summary>DeepSeek V4.1 Flash 1017 response</summary>
 
 ````text
 # Streamlined Chicken Pot Pie (with make-ahead shortcuts)
@@ -137,9 +191,13 @@ Your process is solid — the problem is **sequencing**, not the recipe. You're 
 
 </details>
 
-## Source patch application
+## Applying the patches
 
-Base: [WiCi/InferSSD](https://github.com/wici-ai/inferssd) commit `aa957de2958e8e6df84f87da49b8b4d55484b5bb`. Use a clean checkout. The two patches are staged as Intel/B70 support followed by DeepSeek-specific compatibility.
+Use a clean checkout of [WiCi/InferSSD](https://github.com/wici-ai/inferssd).
+
+1. Check out the pinned upstream revision shown below.
+2. Apply `0001-WiCi-Intel-B70.patch` for Intel GPU support.
+3. Apply `0002-DeepSeek-V4.1-Flash-1017.patch` for DeepSeek compatibility.
 
 ```powershell
 git clone https://github.com/wici-ai/inferssd.git
@@ -149,10 +207,26 @@ git -c core.autocrlf=false apply ../WiCi-Intel-GPU-Patch/0001-WiCi-Intel-B70.pat
 git -c core.autocrlf=false apply ../WiCi-Intel-GPU-Patch/0002-DeepSeek-V4.1-Flash-1017.patch
 ```
 
-The DeepSeek second patch is the same source delta provided in the [separate model-specific project](https://github.com/SuzukiHiakura/DeepSeek-V4.1-Flash-1017-Intel-GPU-Patch). The Intel-only first stage has not been separately benchmarked as a newly rebuilt release; the recorded results come from the tested local model-specific builds. Source patch application and final-file hashes are checked separately from runtime testing. A clean portable rebuild has not been run on another machine. [Build configuration](BUILD-NOTES.md).
+The second patch is also distributed by the [DeepSeek Intel GPU patch project](https://github.com/SuzukiHiakura/DeepSeek-V4.1-Flash-1017-Intel-GPU-Patch). **Apply the DeepSeek stage once.**
+
+### Validation scope
+
+- The recorded local builds successfully ran both models on the B70.
+- Patch application and final source-file hashes were checked separately.
+- The newly separated Intel-only stage has not been benchmarked as a fresh release build.
+- A clean portable rebuild on another machine has not been performed. Other Intel GPUs and model variants are unverified.
+
+See [build and benchmark settings](BUILD-NOTES.md).
 
 ## Development and license
 
-Approximate development: **November13–17,2026**; final DeepSeek correction and successful test: **November17,2026**. Recorded goal activity was about25hours39minutes, including builds, runs and waits; engineering-only time was not separately measured. This review copy was prepared at `2026-11-17T19:52:55.260783+00:00`.
+- **Approximate development period:** November 13–17, 2026.
+- **Successful DeepSeek correction and test:** November 17, 2026.
+- **Recorded goal activity:** About 25 hours 39 minutes, including builds, test runs and waits. Engineering-only time was not tracked separately.
+- **Preview prepared:** November 17, 2026, at 19:52 UTC. The exact timestamp is retained in [REVIEW-STATUS.json](REVIEW-STATUS.json).
 
-GNU **GPL-3.0-or-later** project/patch distribution, with original Apache-2.0 and MIT notices preserved. [GNU license](LICENSE) · [upstream notices](NOTICE) · [third-party licenses](THIRD-PARTY.md).
+New project work and patch distribution use **GNU GPL version 3 or later**. Original Apache 2.0 and MIT notices are preserved.
+
+- [GNU GPL license](LICENSE)
+- [Upstream notices](NOTICE)
+- [Third-party license information](THIRD-PARTY.md)
