@@ -149,7 +149,7 @@ git -c core.autocrlf=false apply ../WiCi-Intel-GPU-Patch/0001-WiCi-Intel-B70.pat
 git -c core.autocrlf=false apply ../WiCi-Intel-GPU-Patch/0002-DeepSeek-V4.1-Flash-1017.patch
 ```
 
-The DeepSeek second patch is the same source delta provided in the [separate model-specific project](https://github.com/SuzukiHiakura/DeepSeek-V4.1-Flash-1017-B70-Patch). The Intel-only first stage has not been separately benchmarked as a newly rebuilt release; the recorded results come from the tested local model-specific builds. Source patch application and final-file hashes are checked separately from runtime testing. A clean portable rebuild has not been run on another machine. [Build configuration](BUILD-NOTES.md).
+The DeepSeek second patch is the same source delta provided in the [separate model-specific project](https://github.com/SuzukiHiakura/DeepSeek-V4.1-Flash-1017-Intel-GPU-Patch). The Intel-only first stage has not been separately benchmarked as a newly rebuilt release; the recorded results come from the tested local model-specific builds. Source patch application and final-file hashes are checked separately from runtime testing. A clean portable rebuild has not been run on another machine. [Build configuration](BUILD-NOTES.md).
 
 ## Development and license
 
