@@ -1,0 +1,236 @@
+{
+  "upstream": "https://github.com/wici-ai/inferssd",
+  "base_commit": "aa957de2958e8e6df84f87da49b8b4d55484b5bb",
+  "verified_upstream_blob_count": 32,
+  "intel_patch_files": [
+    "engine/common/common.cpp",
+    "engine/ggml/include/ggml-vulkan.h",
+    "engine/ggml/src/ggml-alloc.c",
+    "engine/ggml/src/ggml-backend.cpp",
+    "engine/ggml/src/ggml-ssd/settings/registry.def",
+    "engine/ggml/src/ggml-ssd/settings/settings.cpp",
+    "engine/ggml/src/ggml-ssd/settings/settings.h",
+    "engine/ggml/src/ggml-ssd/stream/CMakeLists.txt",
+    "engine/ggml/src/ggml-ssd/stream/buffer-cache.cpp",
+    "engine/ggml/src/ggml-ssd/stream/buffer-cache.h",
+    "engine/ggml/src/ggml-ssd/stream/memory-guard.cpp",
+    "engine/ggml/src/ggml-ssd/stream/memory-guard.h",
+    "engine/ggml/src/ggml-ssd/stream/runtime.cpp",
+    "engine/ggml/src/ggml-ssd/stream/runtime.h",
+    "engine/ggml/src/ggml-ssd/telemetry/telemetry.cpp",
+    "engine/ggml/src/ggml-ssd/telemetry/telemetry.h",
+    "engine/ggml/src/ggml-vulkan/CMakeLists.txt",
+    "engine/ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+    "engine/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp",
+    "engine/include/llama-ssd.h",
+    "engine/include/llama.h",
+    "engine/src/llama-context.cpp",
+    "engine/src/llama-context.h",
+    "engine/src/llama-model-loader.cpp",
+    "engine/src/llama-model-loader.h",
+    "engine/src/llama-model.cpp",
+    "engine/src/llama-model.h",
+    "engine/src/llama.cpp",
+    "engine/src/ssd/model-source.cpp",
+    "engine/src/ssd/options.cpp",
+    "engine/src/ssd/options.h",
+    "engine/tests/CMakeLists.txt",
+    "engine/tests/ssd/test-b70-buffer-cache.cpp"
+  ],
+  "deepseek_compatibility_files": [
+    "engine/ggml/src/ggml-vulkan/vulkan-shaders/softplus-f32.comp",
+    "engine/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp",
+    "engine/src/b70-deepseek-ops.h",
+    "engine/src/b70-deepseek-tail-rope.h",
+    "engine/src/b70-sparse-rows.h",
+    "engine/src/llama-graph.cpp",
+    "engine/src/llama-graph.h",
+    "engine/src/llama-model-loader.cpp",
+    "engine/src/llama-model.cpp",
+    "engine/src/llama-model.h",
+    "engine/src/llama.cpp",
+    "engine/src/models/deepseek41.cpp"
+  ],
+  "patches": [
+    {
+      "file": "0001-WiCi-Intel-B70.patch",
+      "sha256": "497a6a8c257acb3eaa1a0dbf9a8bf21433e5ec229ab10585de5beafe64e3b647"
+    },
+    {
+      "file": "0002-DeepSeek-V4.1-Flash-1017.patch",
+      "sha256": "1f99c8adb29ec770869bb779b69ac9ccf1a5a411987a843a770f8e6f1ee88794"
+    }
+  ],
+  "final_files": [
+    {
+      "path": "engine/common/common.cpp",
+      "sha256": "d959d89e875a02070cba5978a6b9f4f36004f5ac59dd9296d2720b546e676982"
+    },
+    {
+      "path": "engine/ggml/include/ggml-vulkan.h",
+      "sha256": "fe297f4845f853badcd949355dc2565e90ee135b74db76cd30749c9e6e5d9643"
+    },
+    {
+      "path": "engine/ggml/src/ggml-alloc.c",
+      "sha256": "e830f721dc3dda0b129b332f4df59b0e19c23afe1db6326ac40e6a6e279e3448"
+    },
+    {
+      "path": "engine/ggml/src/ggml-backend.cpp",
+      "sha256": "b2440d03b456e69d73a5482a7938c3bf248b4b598ff937a338300ecc4afcc0a4"
+    },
+    {
+      "path": "engine/ggml/src/ggml-ssd/settings/registry.def",
+      "sha256": "8b5c13e026008aaf8f8482694c9f2c3b7e4b0b27c9a058db579c0b3bcebd23b2"
+    },
+    {
+      "path": "engine/ggml/src/ggml-ssd/settings/settings.cpp",
+      "sha256": "1b8c901ef97b8a9bfaca128d4c05ea24dbde9fb090ba39b10222bd01b366fe3b"
+    },
+    {
+      "path": "engine/ggml/src/ggml-ssd/settings/settings.h",
+      "sha256": "b16784f04844af870e00fa7f55d9b745dbd00b9a61143454fd717e740376f43a"
+    },
+    {
+      "path": "engine/ggml/src/ggml-ssd/stream/CMakeLists.txt",
+      "sha256": "acbbbcba62bfc3635020f060bed9889516d4308f9b5da1bc93c056d2aa67262d"
+    },
+    {
+      "path": "engine/ggml/src/ggml-ssd/stream/buffer-cache.cpp",
+      "sha256": "e3c1bee206435298ebf198df87e34f80cf9f0f63bfd15c18297d179795b9f8cc"
+    },
+    {
+      "path": "engine/ggml/src/ggml-ssd/stream/buffer-cache.h",
+      "sha256": "1136987bb582ed9673f40f7e38c1b794e7f93cf0ae21661bec1f2fa46dd26516"
+    },
+    {
+      "path": "engine/ggml/src/ggml-ssd/stream/memory-guard.cpp",
+      "sha256": "fb10ae90e5d21eacc3ebb96664f6e78f1d2c59860b3017a8a22ae7347a424b54"
+    },
+    {
+      "path": "engine/ggml/src/ggml-ssd/stream/memory-guard.h",
+      "sha256": "87b964dfde6d5556d93d388e3d20b5daf94321018c79588cf9c92ab8dc4f3e2d"
+    },
+    {
+      "path": "engine/ggml/src/ggml-ssd/stream/runtime.cpp",
+      "sha256": "5793cb41bb423fbbbe35f167ec88f6232b04627fc338d4ab67065a0b2c50b09e"
+    },
+    {
+      "path": "engine/ggml/src/ggml-ssd/stream/runtime.h",
+      "sha256": "6ac92627e00984872bd7861c1b2ce02d9094ff1265694bb4f170f50b3844abaf"
+    },
+    {
+      "path": "engine/ggml/src/ggml-ssd/telemetry/telemetry.cpp",
+      "sha256": "d6f33868590d99ad614ce8c9b877b47d65eda280bcd02234bf866339c71655d0"
+    },
+    {
+      "path": "engine/ggml/src/ggml-ssd/telemetry/telemetry.h",
+      "sha256": "9d3a0489b9c0b2552b694fdb63370f365e2e09311f128fa01800c731236fd38a"
+    },
+    {
+      "path": "engine/ggml/src/ggml-vulkan/CMakeLists.txt",
+      "sha256": "e7fc1d83a987abc924ce5e5dd285d528bd92815e7ef4b7d428e8bba8a12b0623"
+    },
+    {
+      "path": "engine/ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+      "sha256": "48d321d29aa6e5950452a90838cd45aa421c5369054fbebd733cf1281b7bde6c"
+    },
+    {
+      "path": "engine/ggml/src/ggml-vulkan/vulkan-shaders/softplus-f32.comp",
+      "sha256": "22a1e53c727e08b8ca55866ea80b78944d6fcba9c6c3e43d20d2273142535a72"
+    },
+    {
+      "path": "engine/ggml/src/ggml-vulkan/vulkan-shaders/softplus.comp",
+      "sha256": "1fa6f74b18e564d75d9cc7bc7de80d80735d88c454b85f741f3906dd53382b91"
+    },
+    {
+      "path": "engine/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp",
+      "sha256": "28f9e90d3fc184429cab7fcb8117a17136ab313da10b1070f3a6475cbe79c5b3"
+    },
+    {
+      "path": "engine/include/llama-ssd.h",
+      "sha256": "ef451ec6c2bbc63d9e62f85059859bc46e1820529875d9a2a07d359971395742"
+    },
+    {
+      "path": "engine/include/llama.h",
+      "sha256": "136185408c516e6ad460a09bf071adab8800a26fda0f6c2d392b2d5c6d88971d"
+    },
+    {
+      "path": "engine/src/b70-deepseek-ops.h",
+      "sha256": "fc93c778e83219fb41400cd7151193eae15744f93e087e5a124b70f49c9c1e8e"
+    },
+    {
+      "path": "engine/src/b70-deepseek-tail-rope.h",
+      "sha256": "42cfaeacb1b789a1ac2bdf78f5b9afe4136f374e54e26ba4f81863b0c6446eae"
+    },
+    {
+      "path": "engine/src/b70-sparse-rows.h",
+      "sha256": "075b8ba522e3b2c66fcfb1c1d483fd15910b4fd43fc7071889606ebb706fb024"
+    },
+    {
+      "path": "engine/src/llama-context.cpp",
+      "sha256": "998d5777698c626b5e372e62035572acbcee05d32b6095ed1752bd24b80d57dd"
+    },
+    {
+      "path": "engine/src/llama-context.h",
+      "sha256": "09b2b70123315885c9707da9a1e00d3b0b800b2a77bc0128293b4cebb90ecb23"
+    },
+    {
+      "path": "engine/src/llama-graph.cpp",
+      "sha256": "27e8e70607dc5d3dca77d4a4d1f1bad59caa5335b0144e12188596833b677cd2"
+    },
+    {
+      "path": "engine/src/llama-graph.h",
+      "sha256": "dd1e69e25c60d986642b647d3a387a2b101a2e7d2012376045bf8bc195e0ecc0"
+    },
+    {
+      "path": "engine/src/llama-model-loader.cpp",
+      "sha256": "e59c223f82678f0c2e85db5184c33ae1ddbcc7477995180a05d3ee998e55c5b0"
+    },
+    {
+      "path": "engine/src/llama-model-loader.h",
+      "sha256": "ef41d7e0713968b235b5bd54379422af09d108c77c659cd96885ad26a7da142c"
+    },
+    {
+      "path": "engine/src/llama-model.cpp",
+      "sha256": "4cffd58d2b02aceeade1db18ec63494ed59fa197a821964f0b797ed974c1fe06"
+    },
+    {
+      "path": "engine/src/llama-model.h",
+      "sha256": "85517b12b4a1c8d518d6051188e7c46ed0ded7530b9fbeecac8827cc33d278f5"
+    },
+    {
+      "path": "engine/src/llama.cpp",
+      "sha256": "22902d430163e28591678b6dc7f335e9ee3f90a9b596bd3d0ef91d28ee2d9bc5"
+    },
+    {
+      "path": "engine/src/models/deepseek41.cpp",
+      "sha256": "9fe099ba6737a83ee496f130255c1b5449f551630be7a1c4289058b94bad2ad3"
+    },
+    {
+      "path": "engine/src/ssd/model-source.cpp",
+      "sha256": "27420ddb55f65d2960a84a3f65d84237747322a84ed00dc884aae1a61efa8687"
+    },
+    {
+      "path": "engine/src/ssd/options.cpp",
+      "sha256": "089ed401b6414335c4150e1ff9091f5e396c845ac8a59fe24234a0f25e3e2860"
+    },
+    {
+      "path": "engine/src/ssd/options.h",
+      "sha256": "365709524cef1458a36f70704dff7ba5bdcb05d9b7a5a701ff57650014396f37"
+    },
+    {
+      "path": "engine/tests/CMakeLists.txt",
+      "sha256": "e1967cc17c5a4c747466e499fe1bf00b12cfc77f57be7032bfed5a56070f30c0"
+    },
+    {
+      "path": "engine/tests/ssd/test-b70-buffer-cache.cpp",
+      "sha256": "4ec9f4ddb8f7446b01000cdbd58d988f5d6a14139770c791a43bbd7abc025ab2"
+    }
+  ],
+  "public_adaptations": [
+    "LF line endings",
+    "Fresh test root uses working directory/canary",
+    "Separate F32 softplus filename and generator selection preserve upstream F16 source"
+  ],
+  "clean_public_rebuild_performed": false
+}

@@ -1,0 +1,2859 @@
+diff --git a/engine/common/common.cpp b/engine/common/common.cpp
+--- a/engine/common/common.cpp
++++ b/engine/common/common.cpp
+@@ -6,6 +6,7 @@
+ #include "fit.h"
+ #include "log.h"
+ #include "llama.h"
++#include "llama-ssd.h"
+ #include "sampling.h"
+ #include "unicode.h"
+ 
+@@ -1145,6 +1146,16 @@
+     pimpl(new impl{}) {
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
++    if(llama_ssd_options_b70_stream(params.ssd_options.get())){
++        if(params.fit_params||params.warmup||!params.lora_adapters.empty()||!params.control_vectors.empty()||
++           cparams.n_ctx==0||cparams.n_ctx>4096||cparams.n_batch==0||cparams.n_batch>64||cparams.n_ubatch==0||cparams.n_ubatch>32||cparams.n_seq_max!=1||
++           cparams.n_threads<1||cparams.n_threads>2||cparams.n_threads_batch<1||cparams.n_threads_batch>2){
++            LOG_ERR("B70 bridge requires explicit bounded context/batches, one sequence, at most two CPU threads, fitting off, warmup off, and no adapters\n");
++            return;
++        }
++        char error[512]={};
++        if(!llama_ssd_options_b70_prepare_model(params.ssd_options.get(),&mparams,error,sizeof(error))){LOG_ERR("B70 model admission failed: %s\n",error);return;}
++    }
+ 
+     if (params.fit_params) {
+         LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on\n", __func__);
+diff --git a/engine/ggml/include/ggml-vulkan.h b/engine/ggml/include/ggml-vulkan.h
+--- a/engine/ggml/include/ggml-vulkan.h
++++ b/engine/ggml/include/ggml-vulkan.h
+@@ -9,6 +9,23 @@
+ 
+ #define GGML_VK_NAME "Vulkan"
+ #define GGML_VK_MAX_DEVICES 16
++
++// Private same-build inspection, obtained through the backend registry.
++// These are the selected VkMemoryType properties and VkMemoryAllocateInfo size,
++// not an estimate from the public ggml buffer size or a host-buffer type name.
++struct ggml_backend_vk_buffer_memory_info_v1 {
++    uint32_t version, size;
++    uint64_t buffer_bytes, allocation_bytes;
++    uint32_t memory_type_index, property_flags;
++    uint32_t device_local, host_visible, imported_host, strict_device_memory;
++};
++typedef bool (*ggml_backend_vk_buffer_memory_query_v1)(ggml_backend_buffer_t,
++    struct ggml_backend_vk_buffer_memory_info_v1 *);
++
++// Allocates one strict B70 buffer only if VkMemoryRequirements.size fits the
++// supplied allowance. No allocation occurs on a budget rejection; no fallback.
++typedef ggml_backend_buffer_t (*ggml_backend_vk_alloc_bounded_v1)(ggml_backend_t,
++    size_t, uint64_t);
+ 
+ // backend API
+ GGML_BACKEND_API ggml_backend_t ggml_backend_vk_init(size_t dev_num);
+diff --git a/engine/ggml/src/ggml-alloc.c b/engine/ggml/src/ggml-alloc.c
+--- a/engine/ggml/src/ggml-alloc.c
++++ b/engine/ggml/src/ggml-alloc.c
+@@ -210,6 +210,10 @@
+     // find the best fitting free block besides the last block, within any chunk
+     for (int c = 0; c < alloc->n_chunks; ++c) {
+         struct tallocr_chunk * chunk = alloc->chunks[c];
++        // Preserve a fully reusable oversized tensor arena for the next plane.
++        // Ordinary scratch can grow a normal chunk instead of fragmenting it.
++        if (size <= alloc->max_chunk_size && alloc->n_chunks < GGML_VBUFFER_MAX_CHUNKS &&
++                chunk->max_size > alloc->max_chunk_size) continue;
+         size_t best_fit_size = SIZE_MAX;
+         for (int i = 0; i < chunk->n_free_blocks - 1; i++) {
+             struct free_block * block = &chunk->free_blocks[i];
+@@ -227,6 +231,8 @@
+         int64_t best_reuse = INT64_MIN;
+         for (int c = 0; c < alloc->n_chunks; ++c) {
+             struct tallocr_chunk * chunk = alloc->chunks[c];
++            if (size <= alloc->max_chunk_size && alloc->n_chunks < GGML_VBUFFER_MAX_CHUNKS &&
++                    chunk->max_size > alloc->max_chunk_size) continue;
+             if (chunk->n_free_blocks > 0) {
+                 struct free_block * block = &chunk->free_blocks[chunk->n_free_blocks - 1];
+                 max_avail = MAX(max_avail, block->size);
+@@ -429,6 +435,9 @@
+ 
+     for (int n = 0; n < talloc->n_chunks; n++) {
+         size_t chunk_size = talloc->chunks[n]->max_size;
++        fprintf(stderr,"[alloc.request] buffer=%.96s chunk=%d chunks=%d bytes=%zu usage=%d\n",
++                ggml_backend_buft_name(buft),n,talloc->n_chunks,chunk_size,(int)usage);
++        fflush(stderr);
+         buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
+         if (buf->chunks[n] == NULL) {
+             ggml_vbuffer_free(buf);
+@@ -929,6 +938,22 @@
+         }
+     }
+ 
++    // Metadata-only inventory, emitted before any chunk allocation can fail.
++    if (!no_alloc) {
++        unsigned recorded = 0, omitted = 0;
++        for (int b = 0; b < galloc->n_buffers; ++b) {
++            struct ggml_dyn_tallocr * plan = galloc->buf_tallocs[b];
++            for (int c = 0; c < plan->n_chunks; ++c) {
++                if (recorded >= 128) { ++omitted; continue; }
++                fprintf(stderr,"[alloc.plan] backend=%d buffer=%.96s chunk=%d chunks=%d planned_bytes=%zu existing_bytes=%zu\n",
++                        b,ggml_backend_buft_name(galloc->bufts[b]),c,plan->n_chunks,
++                        ggml_dyn_tallocr_max_size(plan,c),galloc->buffers[b]?ggml_vbuffer_chunk_size(galloc->buffers[b],c):0);
++                ++recorded;
++            }
++        }
++        fprintf(stderr,"[alloc.plan] recorded=%u omitted=%u complete=%s\n",recorded,omitted,omitted?"false":"true");
++        fflush(stderr);
++    }
+     // reallocate buffers if needed
+     for (int i = 0; i < galloc->n_buffers; i++) {
+         // if the buffer type is used multiple times, we reuse the same buffer
+diff --git a/engine/ggml/src/ggml-backend.cpp b/engine/ggml/src/ggml-backend.cpp
+--- a/engine/ggml/src/ggml-backend.cpp
++++ b/engine/ggml/src/ggml-backend.cpp
+@@ -2003,8 +2003,27 @@
+     sched->debug_causes = sched->debug > 1 ?
+         (char (*)[64]) calloc(sched->hash_set.size, sizeof(sched->debug_causes[0])) : nullptr;
+ 
++    // Private bounded B70 runtime: cap scratch metadata rather than reserving
++    // graph_size * 30 * 2 tensors. Arena exhaustion still fails closed in ggml.
++    bool bounded_b70_metadata = sched->n_copies == 1;
++    int discrete_gpus = 0;
++    for (int b = 0; b < n_backends; ++b) {
++        const auto device = ggml_backend_get_device(backends[b]);
++        const auto type = ggml_backend_dev_type(device);
++        if (type == GGML_BACKEND_DEVICE_TYPE_CPU) continue;
++        const auto registry = ggml_backend_dev_backend_reg(device);
++        const char * name = registry ? ggml_backend_reg_name(registry) : nullptr;
++        const char * description = ggml_backend_dev_description(device);
++        if (type != GGML_BACKEND_DEVICE_TYPE_GPU || !name || strcmp(name,"Vulkan") ||
++            !description || !strstr(description,"Intel") || !strstr(description,"B70")) bounded_b70_metadata = false;
++        ++discrete_gpus;
++    }
++    bounded_b70_metadata = bounded_b70_metadata && discrete_gpus == 1;
+     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
+-    const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
++    // With one copy, every split input comes from a source edge and adds at
++    // most its copied tensor and dependency view. Keep the original graph bound.
++    const size_t input_bound = bounded_b70_metadata ? GGML_MAX_SRC : GGML_SCHED_MAX_SPLIT_INPUTS;
++    const size_t nodes_size = graph_size + ggml_sched_max_splits*input_bound*2;
+     sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
+     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
+     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
+@@ -2014,6 +2033,11 @@
+     sched->debug_prev_graph_size = 0;
+ 
+     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
++    const size_t original_metadata_bytes = sched->context_buffer_size;
++    if (bounded_b70_metadata) sched->context_buffer_size = std::min(sched->context_buffer_size,size_t(16u<<20));
++    fprintf(stderr,"[b70.metadata] bounded=%s graph_size=%zu copies=%d tensor_bytes=%zu original_bytes=%zu arena_bytes=%zu id_slots=%zu\n",
++            bounded_b70_metadata?"true":"false",graph_size,sched->n_copies,sizeof(struct ggml_tensor),original_metadata_bytes,sched->context_buffer_size,nodes_size);
++    fflush(stderr);
+     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
+ 
+     const int initial_splits_capacity = 16;
+diff --git a/engine/ggml/src/ggml-ssd/settings/registry.def b/engine/ggml/src/ggml-ssd/settings/registry.def
+--- a/engine/ggml/src/ggml-ssd/settings/registry.def
++++ b/engine/ggml/src/ggml-ssd/settings/registry.def
+@@ -15,3 +15,11 @@
+ SSD_SETTING("host.budget_mib", integer, 0, 17592186044415, "0", "MiB", "plan", scope_darwin | scope_windows, "", "Host memory envelope in MiB against this process's own memory; zero derives it at startup")
+ SSD_SETTING("model.engram_prefetch", integer, 0, 1, "0", "boolean", "model", scope_all, "", "Read ahead DeepSeek Engram rows; changes I/O timing only")
+ SSD_SETTING("model.hc_fused", integer, 0, 1, "1", "boolean", "model", scope_all, "", "Use the fused hyper connection operations of DeepSeek-V4.1 and Qwen3.8-Flash-Next")
++
++SSD_SETTING("expert.b70_buffer_stream", integer, 0, 1, "0", "boolean", "launch", scope_windows, "", "Windows10 B70 graph expert byte transport, separately admitted from the CPU executor")
++SSD_SETTING("expert.host_cache_mib", integer, 1, 8192, "512", "MiB", "launch", scope_windows, "", "Hard data-commit budget of the private B70 expert RAM cache")
++SSD_SETTING("owned.stop_file", paths, 0, 0, "[]", "path", "launch", scope_windows, "", "Exactly one local owned controller stop file for B70 streaming")
++
++SSD_SETTING("b70.process_vram_mib", integer, 1024, 28672, "24576", "MiB", "launch", scope_windows, "", "Observed whole-process B70 local-memory stop ceiling; cache reservation is separately bounded")
++SSD_SETTING("b70.wddm_headroom_mib", integer, 128, 8192, "1024", "MiB", "launch", scope_windows, "", "Leave this headroom below the current process WDDM local-memory budget")
++SSD_SETTING("b70.nonlocal_vram_mib", integer, 0, 2048, "1024", "MiB", "launch", scope_windows, "", "Observed whole-process B70 nonlocal GPU-memory stop ceiling")
+diff --git a/engine/ggml/src/ggml-ssd/settings/settings.cpp b/engine/ggml/src/ggml-ssd/settings/settings.cpp
+--- a/engine/ggml/src/ggml-ssd/settings/settings.cpp
++++ b/engine/ggml/src/ggml-ssd/settings/settings.cpp
+@@ -327,7 +327,10 @@
+ }
+ 
+ const std::vector<std::string> * snapshot::sources() const noexcept {
+-    const auto * v = find("expert.source");
++    return paths("expert.source");
++}
++const std::vector<std::string> * snapshot::paths(const std::string & key) const noexcept {
++    const auto * v = find(key);
+     return v ? std::get_if<std::vector<std::string>>(&v->data) : nullptr;
+ }
+ 
+diff --git a/engine/ggml/src/ggml-ssd/settings/settings.h b/engine/ggml/src/ggml-ssd/settings/settings.h
+--- a/engine/ggml/src/ggml-ssd/settings/settings.h
++++ b/engine/ggml/src/ggml-ssd/settings/settings.h
+@@ -63,6 +63,7 @@
+     const setting *                   find(const std::string & key) const noexcept;
+     const uint64_t *                  integer(const std::string & key) const noexcept;
+     const std::vector<std::string> *  sources() const noexcept;
++    const std::vector<std::string> *  paths(const std::string & key) const noexcept;
+     const std::vector<uint32_t> *     cpus(const std::string & key) const noexcept;
+     const cost_table *                costs() const noexcept;
+     const budget *                    vram_budget() const noexcept;
+diff --git a/engine/ggml/src/ggml-ssd/stream/CMakeLists.txt b/engine/ggml/src/ggml-ssd/stream/CMakeLists.txt
+--- a/engine/ggml/src/ggml-ssd/stream/CMakeLists.txt
++++ b/engine/ggml/src/ggml-ssd/stream/CMakeLists.txt
+@@ -3,3 +3,7 @@
+ target_include_directories(ggml-ssd-stream PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
+ target_link_libraries(ggml-ssd-stream PUBLIC ggml-base ggml-ssd-settings)
+ set_target_properties(ggml-ssd-stream PROPERTIES POSITION_INDEPENDENT_CODE ON)
++if(WIN32)
++    target_sources(ggml-ssd-stream PRIVATE buffer-cache.cpp buffer-cache.h memory-guard.cpp memory-guard.h)
++    target_link_libraries(ggml-ssd-stream PUBLIC ggml-ssd-win-ring ggml-ssd-platform dxgi)
++endif()
+diff --git a/engine/ggml/src/ggml-ssd/stream/buffer-cache.cpp b/engine/ggml/src/ggml-ssd/stream/buffer-cache.cpp
+new file mode 100644
+--- /dev/null
++++ b/engine/ggml/src/ggml-ssd/stream/buffer-cache.cpp
+@@ -0,0 +1,493 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "buffer-cache.h"
++#include "memory-guard.h"
++#include "ggml-vulkan.h"
++#include "ggml-backend-impl.h"
++#include "ggml-impl.h"
++#include "platform/file.h"
++#include "platform/memory.h"
++#include "io/win-ring.h"
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <iterator>
++#include <list>
++#include <map>
++#include <set>
++#include <mutex>
++#include <stdexcept>
++#include <tuple>
++#include <utility>
++#include <vector>
++#if !defined(_WIN32)
++#error "This private cache must not be selected on another OS"
++#endif
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++
++namespace ssd { namespace stream {
++namespace {
++constexpr uint64_t mib=uint64_t{1}<<20;
++constexpr size_t alignment=4096,max_read=64*size_t(mib),max_entries=4096;
++using clock=std::chrono::steady_clock;
++size_t aligned_size(size_t n) {
++    if(n>SIZE_MAX-(alignment-1))throw std::runtime_error("expert size overflow");
++    return (n+alignment-1)&~(alignment-1);
++}
++void require(bool ok,const char * why){if(!ok)throw std::runtime_error(why);}
++struct meta_owner {
++    ggml_context * value=nullptr;
++    explicit meta_owner(size_t tensors=4) {
++        value=ggml_init({ggml_tensor_overhead()*tensors,nullptr,true});
++        require(value!=nullptr,"cache tensor metadata allocation failed");
++    }
++    ~meta_owner(){if(value)ggml_free(value);}
++    meta_owner(const meta_owner &)=delete;
++};
++// Include the actual file version, offset and copied bytes; a tensor name or
++// layer/expert index alone is not a payload identity.
++using key=std::tuple<uint64_t,uint64_t,uint64_t,uint64_t,int64_t,int64_t,uint64_t,size_t>;
++key make_key(const platform::file_identity & f,uint64_t offset,size_t bytes){
++    return {f.device,f.id_lo,f.id_hi,f.size,f.mtime_ns,f.ctime_ns,offset,bytes};
++}
++struct host_entry {
++    void * arena=nullptr;
++    size_t allocated=0,lead=0;
++    std::list<key>::iterator lru;
++    ~host_entry(){if(arena)platform::arena_release(arena,allocated);}
++};
++struct gpu_entry {
++    meta_owner meta;
++    ggml_tensor * raw=nullptr;
++    size_t allocated=0,chunk=0,offset=0;
++    std::list<key>::iterator lru;
++};
++struct gpu_chunk {
++    ggml_backend_buffer_t buffer=nullptr;
++    size_t bytes=0;
++    uint64_t allocation_bytes=0;
++    std::map<size_t,size_t> free;
++    ~gpu_chunk(){if(buffer)ggml_backend_buffer_free(buffer);}
++};
++struct read_custody {
++    io::win_ring & ring;
++    ~read_custody(){
++        if(ring.pending()){
++            std::fputs("[b70.cache] failed read still owns a kernel buffer; aborting before release\n",stderr);
++            std::abort();
++        }
++    }
++};
++}
++
++struct buffer_cache::impl {
++    store::source_view source;
++    const uint64_t host_budget,gpu_budget;
++    const uint64_t process_limit,headroom,nonlocal_limit;
++    ggml_backend_t backend=nullptr;
++    ggml_backend_dev_t device=nullptr;
++    ggml_backend_vk_buffer_memory_query_v1 memory_query=nullptr;
++    ggml_backend_vk_alloc_bounded_v1 bounded_alloc=nullptr;
++    io::win_ring ring;
++    counters count;
++    std::map<int,platform::file_identity> file_versions;
++    std::map<key,std::unique_ptr<host_entry>> host;
++    std::map<key,std::unique_ptr<gpu_entry>> gpu;
++    std::vector<std::unique_ptr<gpu_chunk>> chunks;
++    std::unique_ptr<memory_guard> memory;
++    std::list<key> host_lru,gpu_lru;
++    mutable std::mutex mutex;
++    bool (*stop)(void *)=nullptr;
++    void * stop_data=nullptr;
++    uint64_t tag=0;
++    bool failed=false;
++    source_validator validator=nullptr;
++    void * validator_data=nullptr;
++
++    impl(store::source_view s,uint64_t h,uint64_t g,uint64_t limit,uint64_t spare,uint64_t shared):
++        source(s),host_budget(h),gpu_budget(g),process_limit(limit),headroom(spare),nonlocal_limit(shared) {
++        require(source.resolve!=nullptr,"expert source resolver required");
++        require(h>=mib && h<=8*1024*mib && g>=64*mib && g<=16*1024*mib && g%(64*mib)==0,"cache budget outside admission range or 64MiB arena quantum");
++        auto r=ring.init(1,false);require(bool(r),"Windows read ring initialization failed");
++        require(std::strcmp(ring.backend_name(),"overlapped")==0,"Windows10 overlapped backend required");
++    }
++    ~impl(){
++        // Destruction occurs before the borrowed backend/source descriptors.
++        if(backend)ggml_backend_synchronize(backend);
++        gpu.clear();chunks.clear();host.clear();ring.close_ring();
++    }
++    void evict_host(){
++        require(!host_lru.empty(),"host cache cannot satisfy its budget");
++        const key victim=host_lru.back();auto it=host.find(victim);
++        require(it!=host.end(),"host cache LRU invariant");
++        count.host_live-=it->second->allocated;host.erase(it);host_lru.pop_back();++count.host_evictions;
++    }
++    void evict_gpu(){
++        require(!gpu_lru.empty(),"GPU cache cannot satisfy its budget");
++        const key victim=gpu_lru.back();auto it=gpu.find(victim);
++        require(it!=gpu.end(),"GPU cache LRU invariant");
++        // No entry is borrowed across a synchronous copy/scheduler fence.
++        ggml_backend_synchronize(backend);
++        const auto & entry=*it->second;
++        auto & spans=chunks.at(entry.chunk)->free;
++        size_t begin=entry.offset,bytes=entry.allocated;
++        auto after=spans.lower_bound(begin);
++        if(after!=spans.end()&&begin+bytes==after->first){bytes+=after->second;after=spans.erase(after);}
++        if(after!=spans.begin()){
++            auto before=std::prev(after);
++            if(before->first+before->second==begin){begin=before->first;bytes+=before->second;spans.erase(before);}
++        }
++        spans.emplace(begin,bytes);
++        count.gpu_live-=entry.allocated;gpu.erase(it);gpu_lru.pop_back();++count.gpu_evictions;
++    }
++    std::pair<size_t,size_t> slot(size_t needed){
++        constexpr size_t quantum=64*size_t(mib);
++        require(needed<=quantum,"one GPU expert exceeds a bounded cache arena");
++        for(;;){
++            for(size_t i=0;i<chunks.size();++i){
++                auto & spans=chunks[i]->free;
++                for(auto it=spans.begin();it!=spans.end();++it){
++                    if(it->second<needed)continue;
++                    const size_t offset=it->first,remainder=it->second-needed;
++                    spans.erase(it);if(remainder)spans.emplace(offset+needed,remainder);
++                    return {i,offset};
++                }
++            }
++            if(count.gpu_reserved+quantum<=gpu_budget){
++                require(memory!=nullptr,"WDDM memory accounting missing");memory->check(quantum);
++                auto arena=std::make_unique<gpu_chunk>();
++                require(count.gpu_allocation_bytes<gpu_budget,"B70 physical cache allowance exhausted");
++                require(bounded_alloc!=nullptr,"B70 bounded allocation interface missing");
++                arena->buffer=bounded_alloc(backend,quantum,gpu_budget-count.gpu_allocation_bytes);
++                require(arena->buffer!=nullptr,"bounded B70 cache arena allocation failed");
++                arena->bytes=ggml_backend_buffer_get_size(arena->buffer);
++                require(arena->bytes==quantum,"B70 cache arena allocation differs from reserved bytes");
++                ggml_backend_vk_buffer_memory_info_v1 info{};info.version=1;info.size=sizeof(info);
++                require(memory_query&&memory_query(arena->buffer,&info)&&info.strict_device_memory&&info.device_local&&!info.imported_host,
++                        "B70 arena lacks proved strict device-local Vulkan allocation");
++                require(info.buffer_bytes==arena->bytes&&info.allocation_bytes>=arena->bytes&&
++                        info.allocation_bytes<=gpu_budget-count.gpu_allocation_bytes,"B70 physical arena allocation exceeds budget");
++                arena->allocation_bytes=info.allocation_bytes;++count.device_local_checks;
++                ggml_backend_buffer_set_usage(arena->buffer,GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                arena->free.emplace(0,arena->bytes);
++                count.gpu_reserved+=arena->bytes;count.gpu_reserved_peak=std::max(count.gpu_reserved_peak,count.gpu_reserved);
++                count.gpu_allocation_bytes+=arena->allocation_bytes;
++                count.gpu_allocation_peak=std::max(count.gpu_allocation_peak,count.gpu_allocation_bytes);
++                chunks.push_back(std::move(arena));memory->check();
++            }else{
++                evict_gpu();
++            }
++        }
++    }
++    platform::file_identity version(int fd){
++        platform::file_identity now;
++        require(platform::is_direct(fd)&&platform::identity(fd,now),"expert source is not a direct regular file");
++        const auto prior=file_versions.find(fd);
++        if(prior==file_versions.end()){
++            require(file_versions.size()<1024,"expert source count exceeds qualification bound");
++            file_versions.emplace(fd,now);
++        }
++        else require(prior->second==now,"expert source changed; no retry or invalidation fallback");
++        return now;
++    }
++    bool stopping()const{return stop&&stop(stop_data);}
++    host_entry & read(const key & k,int fd,uint64_t offset,size_t bytes,const platform::file_identity & id){
++        const auto hit=host.find(k);
++        if(hit!=host.end()){
++            ++count.host_hits;host_lru.splice(host_lru.begin(),host_lru,hit->second->lru);return *hit->second;
++        }
++        ++count.host_misses;
++        const uint64_t begin=offset&~uint64_t(alignment-1);
++        const size_t lead=size_t(offset-begin),physical=aligned_size(lead+bytes);
++        require(physical<=max_read && physical<=host_budget,"one expert exceeds read/cache budget");
++        require(offset<=id.size && bytes<=id.size-offset,"expert range exceeds immutable file");
++        while(count.host_live+physical>host_budget || host.size()>=max_entries)evict_host();
++        auto e=std::make_unique<host_entry>();e->allocated=physical;e->lead=lead;
++        e->arena=platform::arena_reserve(physical);
++        require(e->arena&&platform::arena_commit(e->arena,physical),"bounded expert arena allocation failed");
++        const uint64_t ticket=++tag;
++        read_custody borrowed{ring}; // unwinds before e; a pending read cannot outlive its buffer
++        require(!stopping(),"stop requested before SSD read");
++        require(bool(ring.queue({fd,begin,physical},e->arena,ticket,false)),"expert read queue failed");
++        require(bool(ring.submit(1)),"expert read submit failed");
++        const auto deadline=clock::now()+std::chrono::seconds(5);
++        auto cancel_deadline=deadline+std::chrono::seconds(2);
++        bool cancelled=false,received=false;
++        io::completion completion={};
++        while(!received){
++            const auto r=ring.pop(completion);require(bool(r),"expert read completion failed");
++            if(r.value){received=true;break;}
++            if(!cancelled&&(clock::now()>=deadline||stopping())){
++                const HANDLE file=static_cast<HANDLE>(platform::native_handle(fd));
++                const BOOL ok=CancelIoEx(file,nullptr);
++                require(ok||GetLastError()==ERROR_NOT_FOUND,"cancel exact owned source handle failed");
++                cancelled=true;++count.cancellations;
++                cancel_deadline=clock::now()+std::chrono::seconds(2);
++            }
++            // An undrained kernel buffer must never be released or reused.
++            // Abort is a failed run; the owner retains evidence and cannot retry.
++            if(cancelled&&clock::now()>=cancel_deadline){
++                std::fputs("[b70.cache] cancellation did not drain; aborting owned run\n",stderr);std::abort();
++            }
++            Sleep(1);
++        }
++        require(ring.pending()==0&&completion.user_data==ticket,"expert read completion identity mismatch");
++        ++count.ssd_reads;
++        if(completion.res>0)count.ssd_bytes+=uint64_t(completion.res);
++        require(!cancelled&&completion.res>=0&&size_t(completion.res)>=lead+bytes,"expert read short/error/cancelled");
++        require(version(fd)==id,"expert file version changed during read");
++        host_lru.push_front(k);e->lru=host_lru.begin();
++        count.host_live+=physical;count.host_peak=std::max(count.host_peak,count.host_live);
++        auto & result=*e;host.emplace(k,std::move(e));return result;
++    }
++    gpu_entry & resident(const key & k,int fd,uint64_t offset,size_t bytes,const platform::file_identity & id){
++        const auto hit=gpu.find(k);
++        if(hit!=gpu.end()){
++            ++count.gpu_hits;gpu_lru.splice(gpu_lru.begin(),gpu_lru,hit->second->lru);return *hit->second;
++        }
++        ++count.gpu_misses;
++        const size_t align=ggml_backend_get_alignment(backend);
++        require(align && bytes<=SIZE_MAX-align,"GPU cache size overflow");
++        const size_t needed=(bytes+align-1)/align*align;
++        require(needed<=gpu_budget,"one expert exceeds GPU cache budget");
++        while(count.gpu_live+needed>gpu_budget || gpu.size()>=max_entries)evict_gpu();
++        host_entry & cpu=read(k,fd,offset,bytes,id);
++        const auto location=slot(needed);
++        auto e=std::make_unique<gpu_entry>();
++        e->raw=ggml_new_tensor_1d(e->meta.value,GGML_TYPE_I8,int64_t(bytes));
++        e->allocated=needed;e->chunk=location.first;e->offset=location.second;
++        auto buffer=chunks[e->chunk]->buffer;
++        require(ggml_backend_tensor_alloc(buffer,e->raw,static_cast<char *>(ggml_backend_buffer_get_base(buffer))+e->offset)==GGML_STATUS_SUCCESS,"GPU raw expert placement failed");
++        ggml_backend_tensor_set(e->raw,static_cast<const char *>(cpu.arena)+cpu.lead,0,bytes);
++        ggml_backend_synchronize(backend);memory->check();count.h2d_bytes+=bytes;
++        gpu_lru.push_front(k);e->lru=gpu_lru.begin();
++        count.gpu_live+=e->allocated;count.gpu_peak=std::max(count.gpu_peak,count.gpu_live);
++        auto & result=*e;gpu.emplace(k,std::move(e));return result;
++    }
++};
++
++buffer_cache::buffer_cache(store::source_view s,uint64_t host,uint64_t gpu,uint64_t limit,uint64_t spare,uint64_t shared):state_(new impl(s,host,gpu,limit,spare,shared)){}
++buffer_cache::~buffer_cache()=default;
++void buffer_cache::set_stop(bool(*f)(void *),void * data)noexcept{state_->stop=f;state_->stop_data=data;}
++void buffer_cache::bind_source(source_validator validator,void * userdata){
++    auto & s=*state_;std::lock_guard<std::mutex> lock(s.mutex);
++    require(!s.failed&&!s.validator&&validator&&userdata,"One exact immutable source validator is required");
++    s.validator=validator;s.validator_data=userdata;
++}
++bool buffer_cache::prepare_graph(ggml_backend_sched_t scheduler,ggml_cgraph * graph)noexcept{
++    auto & s=*state_;std::lock_guard<std::mutex> lock(s.mutex);
++    try{
++        require(!s.failed&&s.backend&&s.validator&&scheduler&&graph,"B70 graph requires its attached source/backend");
++        require(!s.stopping(),"owned stop requested before graph allocation");
++        require(s.memory!=nullptr,"WDDM process accounting missing");s.memory->check();
++        // Metadata-only rejection inventory. No allocation, source read, compute or
++        // admission decision is changed. The original refusal loop follows intact.
++        unsigned rejected = 0, signatures_logged = 0, unrecorded_occurrences = 0;
++        std::set<std::string> signatures;
++        auto tensor_signature = [](const ggml_tensor * t) {
++            if (!t) return std::string("null");
++            std::string out = std::string(ggml_op_name(t->op))+":"+ggml_type_name(t->type)+":"+std::to_string(ggml_nbytes(t));
++            for (int d=0;d<4;++d) out += ":"+std::to_string(t->ne[d])+"/"+std::to_string(t->nb[d]);
++            for (auto parameter:t->op_params) out += ":"+std::to_string(parameter);
++            return out;
++        };
++        auto describe = [](const char * role,int index,const ggml_tensor * t) {
++            if (!t) return;
++            std::fprintf(stderr,"[b70.reject] %s=%d name=%.96s op=%s type=%s bytes=%zu ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] buffer=%.96s view=%.96s params=",
++                role,index,t->name,ggml_op_name(t->op),ggml_type_name(t->type),ggml_nbytes(t),
++                (long long)t->ne[0],(long long)t->ne[1],(long long)t->ne[2],(long long)t->ne[3],
++                t->nb[0],t->nb[1],t->nb[2],t->nb[3],t->buffer?ggml_backend_buffer_name(t->buffer):"unallocated",t->view_src?t->view_src->name:"none");
++            for (auto parameter:t->op_params) std::fprintf(stderr,"%08x,",unsigned(parameter));
++            std::fputc('\n',stderr);
++        };
++        for (int i=0;i<ggml_graph_n_nodes(graph);++i) {
++            auto * n=ggml_graph_node(graph,i);
++            switch(n->op) {
++                case GGML_OP_NONE:case GGML_OP_VIEW:case GGML_OP_RESHAPE:
++                case GGML_OP_PERMUTE:case GGML_OP_TRANSPOSE:continue;
++                default:break;
++            }
++            if ((i&63)==0) require(!s.stopping(),"Owned stop requested during graph rejection inventory");
++            if (ggml_backend_dev_supports_op(s.device,n)) continue;
++            ++rejected;
++            auto signature=tensor_signature(n);
++            for (int j=0;j<GGML_MAX_SRC;++j) signature += "|"+tensor_signature(n->src[j]);
++            if (signatures.count(signature)) continue;
++            if (signatures.size()>=128) { ++unrecorded_occurrences;continue; }
++            signatures.insert(std::move(signature));++signatures_logged;
++            describe("node",i,n);
++            for (int j=0;j<GGML_MAX_SRC;++j) if(n->src[j]) describe("src",j,n->src[j]);
++        }
++        if(rejected) {
++            std::fprintf(stderr,"[b70.reject] rejected_occurrences=%u signatures_logged=%u unrecorded_occurrences=%u signature_inventory_complete=%s\n",
++                rejected,signatures_logged,unrecorded_occurrences,unrecorded_occurrences?"false":"true");
++            std::fflush(stderr);
++        }
++        std::set<const ggml_tensor *> admitted,used;
++        auto host_weight=[&](const ggml_tensor * tensor)->bool{
++            if(!tensor)return false;
++            const auto * root=tensor;
++            size_t views=0;
++            while(root->view_src){require(++views<=16,"Expert view chain exceeds its bound");root=root->view_src;}
++            const auto buffer=tensor->buffer?tensor->buffer:root->buffer;
++            if(!buffer||ggml_backend_buffer_get_usage(buffer)!=GGML_BACKEND_BUFFER_USAGE_WEIGHTS||!ggml_backend_buffer_is_host(buffer))return false;
++            require(root==tensor,"Deferred-weight aliases/views cannot bypass native source binding");
++            require(tensor->ne[2]>=2&&tensor->ne[2]<=65536&&tensor->ne[3]==1&&ggml_is_contiguous(tensor),"Host weight is not an admitted expert plane");
++            const size_t stride=tensor->nb[2];const int64_t experts=tensor->ne[2];
++            require(stride&&uint64_t(experts)<=SIZE_MAX/stride&&size_t(experts)*stride==ggml_nbytes(tensor),"Native expert geometry overflows");
++            if(admitted.insert(tensor).second){
++                int first_fd=-1,last_fd=-1;uint64_t first_offset=0,last_offset=0;size_t first_bytes=0,last_bytes=0;
++                require(s.source.resolve(s.source.userdata,tensor->name,0,stride,experts,&first_fd,&first_offset,&first_bytes)&&
++                    s.source.resolve(s.source.userdata,tensor->name,int(experts-1),stride,experts,&last_fd,&last_offset,&last_bytes)&&
++                    first_fd==last_fd&&first_bytes==stride&&last_bytes==stride&&
++                    first_offset<=UINT64_MAX-uint64_t(experts-1)*stride&&last_offset==first_offset+uint64_t(experts-1)*stride&&
++                    s.validator(s.validator_data,tensor,first_fd,first_offset,stride,experts,0)&&
++                    s.validator(s.validator_data,tensor,last_fd,last_offset,stride,experts,int(experts-1)),
++                    "Expert source endpoints do not match the actual loaded model catalog");
++            }
++            return true;
++        };
++        int routed=0;
++        for(int i=0;i<ggml_graph_n_nodes(graph);++i){
++            auto * node=ggml_graph_node(graph,i);
++            for(int j=0;j<GGML_MAX_SRC;++j){
++                const auto * source=node->src[j];
++                if(host_weight(source)){
++                    require(node->op==GGML_OP_MUL_MAT_ID&&j==0,"Every deferred-weight use must enter the exact expert-copy hook");
++                    used.insert(source);
++                }
++            }
++            if(node->op==GGML_OP_MUL_MAT_ID){require(host_weight(node->src[0]),"Every routed matrix must use its native deferred expert plane");}
++            switch(node->op){
++                case GGML_OP_NONE:case GGML_OP_VIEW:case GGML_OP_RESHAPE:
++                case GGML_OP_PERMUTE:case GGML_OP_TRANSPOSE:continue;
++                default:break;
++            }
++            require(ggml_backend_dev_supports_op(s.device,node),"B70 lacks a required graph operator before allocation");
++            ggml_backend_sched_set_tensor_backend(scheduler,node,s.backend);
++            if(node->op==GGML_OP_MUL_MAT_ID)++routed;
++        }
++        for(int i=0;i<graph->n_leafs;++i){
++            const auto * leaf=graph->leafs[i];
++            if(host_weight(leaf)){require(used.count(leaf)>0,"Deferred expert leaf has no admitted direct routed use");}
++        }
++        require(routed>0&&used==admitted,"SSD graph has missing or untracked deferred expert uses");
++        return true;
++    }catch(const std::exception & e){s.failed=true;std::fprintf(stderr,"[b70.cache] graph placement failed: %.512s\n",e.what());return false;}
++}
++bool buffer_cache::validate_graph(ggml_backend_sched_t scheduler,ggml_cgraph * graph)noexcept{
++    auto & s=*state_;std::lock_guard<std::mutex> lock(s.mutex);
++    try{
++        require(!s.failed&&s.backend&&scheduler&&graph,"B70 graph requires a healthy attached cache");
++        require(!s.stopping(),"owned stop requested before graph execution");
++        require(s.memory!=nullptr,"WDDM process accounting missing");s.memory->check();
++        int routed=0;
++        for(int i=0;i<ggml_graph_n_nodes(graph);++i){
++            auto * node=ggml_graph_node(graph,i);
++            // These operators only describe the same storage; no arithmetic
++            // runs on a CPU by allowing their metadata to be hosted there.
++            switch(node->op){
++                case GGML_OP_NONE:case GGML_OP_VIEW:case GGML_OP_RESHAPE:
++                case GGML_OP_PERMUTE:case GGML_OP_TRANSPOSE:continue;
++                default:break;
++            }
++            auto * selected=ggml_backend_sched_get_tensor_backend(scheduler,node);
++            require(selected==s.backend,"compute selected another backend; no CPU/AMD/CUDA fallback");
++            require(ggml_backend_dev_supports_op(s.device,node),"B70 lacks a required graph operator");
++            if(node->op==GGML_OP_MUL_MAT_ID)++routed;
++        }
++        require(routed>0,"SSD graph contains no routed expert computation");
++        return true;
++    }catch(const std::exception & e){s.failed=true;std::fprintf(stderr,"[b70.cache] graph admission failed: %.512s\n",e.what());return false;}
++}
++void buffer_cache::attach(ggml_backend_t backend){
++    auto & s=*state_;std::lock_guard<std::mutex> lock(s.mutex);
++    require(backend!=nullptr&&!s.backend,"B70 cache backend attached twice or missing");
++    const auto device=ggml_backend_get_device(backend);
++    const auto registry=ggml_backend_dev_backend_reg(device);
++    const char * type=ggml_backend_reg_name(registry),*desc=ggml_backend_dev_description(device);
++    require(type&&std::strcmp(type,"Vulkan")==0&&desc&&std::strstr(desc,"Intel")&&std::strstr(desc,"B70")&&
++            ggml_backend_dev_type(device)==GGML_BACKEND_DEVICE_TYPE_GPU,"B70 discrete Vulkan backend required; no fallback");
++    size_t free=0,total=0;ggml_backend_dev_memory(device,&free,&total);
++    require(total>=24*1024*mib && free>=s.gpu_budget+1024*mib,"B70 memory reserve insufficient");
++    require(!std::getenv("GGML_VK_PREFER_HOST_MEMORY")&&!std::getenv("GGML_VK_ALLOW_SYSMEM_FALLBACK"),"B70 rejects inherited host/fallback flags by name");
++    s.memory_query=reinterpret_cast<ggml_backend_vk_buffer_memory_query_v1>(ggml_backend_reg_get_proc_address(registry,"ggml_backend_vk_buffer_memory_query_v1"));
++    require(s.memory_query!=nullptr,"Same-build B70 memory inspection interface required");
++    s.bounded_alloc=reinterpret_cast<ggml_backend_vk_alloc_bounded_v1>(ggml_backend_reg_get_proc_address(registry,"ggml_backend_vk_alloc_bounded_v1"));
++    require(s.bounded_alloc!=nullptr,"Same-build B70 preallocation physical-budget interface required");
++    s.backend=backend;s.device=device;
++    s.memory=std::make_unique<memory_guard>(s.process_limit,s.headroom,s.nonlocal_limit);s.memory->check();
++}
++bool buffer_cache::observe_memory()noexcept{
++    auto & s=*state_;std::lock_guard<std::mutex> lock(s.mutex);
++    try{require(!s.failed&&s.memory,"healthy WDDM accounting required");s.memory->check();return true;}
++    catch(const std::exception & e){s.failed=true;std::fprintf(stderr,"[b70.cache] memory admission failed: %.512s\n",e.what());return false;}
++}
++void buffer_cache::invalidate()noexcept{
++    std::lock_guard<std::mutex> lock(state_->mutex);state_->failed=true;
++}
++int buffer_cache::copy(ggml_backend_t backend,const ggml_tensor * input,ggml_tensor * output,int64_t experts,size_t stride,const int32_t * counts)noexcept{
++    auto & s=*state_;std::lock_guard<std::mutex> lock(s.mutex);
++    try{
++        require(!s.failed&&s.validator,"expert cache requires healthy native source binding; no retry");
++        require(s.backend&&backend==s.backend&&ggml_backend_get_device(backend)==s.device,"SSD copy addressed a different backend");
++        require(input&&output&&counts&&experts>0&&experts<=65536&&stride>0,"invalid expert copy geometry");
++        require(input->type==output->type&&ggml_are_same_shape(input,output),"expert source and destination types/shapes differ");
++        require(input->ne[2]==experts&&input->nb[2]==stride&&ggml_nbytes(input)==ggml_nbytes(output),"expert tensor stride/shape mismatch");
++        require(input->ne[3]==1&&output->ne[3]==1&&ggml_is_contiguous(input)&&ggml_is_contiguous(output),"expert byte transport requires one contiguous expert plane");
++        require(uint64_t(experts)<=SIZE_MAX/stride&&size_t(experts)*stride==ggml_nbytes(input),"expert plane does not cover the exact tensor bytes");
++        require(ggml_backend_buffer_is_host(input->buffer),"expert source must retain metadata on its host buffer");
++        require(!ggml_backend_buffer_is_host(output->buffer),"expert destination must be a B70 device buffer");
++        require(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(output->buffer))==s.device,"expert destination is on a different GPU");
++        ggml_backend_synchronize(backend);
++        ggml_backend_vk_buffer_memory_info_v1 destination_info{};destination_info.version=1;destination_info.size=sizeof(destination_info);
++        require(s.memory_query&&s.memory_query(output->buffer,&destination_info)&&destination_info.strict_device_memory&&
++                destination_info.device_local&&!destination_info.imported_host,"Expert destination lacks actual strict device-local memory");
++        ++s.count.device_local_checks;s.count.last_destination_allocation_bytes=destination_info.allocation_bytes;
++        for(int64_t expert=0;expert<experts;++expert){
++            require(counts[expert]>=0,"invalid negative expert count");
++            if(counts[expert]==0)continue;
++            require(!s.stopping(),"stop requested before GPU expert copy");
++            int fd=-1;uint64_t offset=0;size_t logical=0;
++            require(s.source.resolve(s.source.userdata,input->name,int(expert),stride,experts,&fd,&offset,&logical)&&logical==stride,"missing exact expert source range");
++            require(s.validator(s.validator_data,input,fd,offset,stride,experts,int(expert)),"Expert alias does not match the actual loaded source catalog");
++            const auto id=s.version(fd);
++            require(offset<=id.size&&stride<=id.size-offset,"logical expert range exceeds the immutable file");
++            const size_t padding=expert+1<experts?std::min<size_t>(stride,512):0;
++            if(padding){
++                int next_fd=-1;uint64_t next_offset=0;size_t next_bytes=0;
++                require(s.source.resolve(s.source.userdata,input->name,int(expert+1),stride,experts,&next_fd,&next_offset,&next_bytes)&&
++                    next_fd==fd&&next_offset==offset+stride&&next_bytes==stride&&
++                    s.validator(s.validator_data,input,next_fd,next_offset,stride,experts,int(expert+1)),"padding requires contiguous catalog-bound GGUF experts");
++            }
++            const size_t bytes=stride+padding;
++            require(uint64_t(expert)<=SIZE_MAX/stride,"expert destination offset overflow");
++            const size_t to=size_t(expert)*stride;
++            require(to<=ggml_nbytes(output)&&bytes<=ggml_nbytes(output)-to,"expert destination range overflow");
++            auto & resident=s.resident(make_key(id,offset,bytes),fd,offset,bytes,id);
++            meta_owner meta;
++            auto * destination=ggml_new_tensor_1d(meta.value,GGML_TYPE_I8,int64_t(bytes));
++            require(ggml_backend_tensor_alloc(output->buffer,destination,static_cast<char *>(output->data)+to)==GGML_STATUS_SUCCESS,"B70 destination byte view placement failed");
++            require(ggml_backend_buffer_copy_tensor(resident.raw,destination),"B70 device-to-device copy unavailable; no host staging fallback");
++            ggml_backend_synchronize(backend);s.memory->check();s.count.d2d_bytes+=bytes;++s.count.slices;
++        }
++        return 1;
++    }catch(const std::exception & error){s.failed=true;std::fprintf(stderr,"[b70.cache] failure, no fallback: %.512s\n",error.what());return -1;}
++}
++buffer_cache::counters buffer_cache::stats()const{std::lock_guard<std::mutex> lock(state_->mutex);return state_->count;}
++std::string buffer_cache::stats_json()const{
++    const auto c=stats();std::string out="{";
++#define FIELD(name) out+="\"" #name "\":"+std::to_string(c.name)+",";
++    FIELD(ssd_reads) FIELD(ssd_bytes) FIELD(host_hits) FIELD(host_misses) FIELD(host_evictions)
++    FIELD(gpu_hits) FIELD(gpu_misses) FIELD(gpu_evictions) FIELD(h2d_bytes) FIELD(d2d_bytes) FIELD(slices)
++    FIELD(host_live) FIELD(host_peak) FIELD(gpu_live) FIELD(gpu_peak) FIELD(gpu_reserved) FIELD(gpu_reserved_peak) FIELD(cancellations)
++    FIELD(gpu_allocation_bytes) FIELD(gpu_allocation_peak) FIELD(device_local_checks) FIELD(last_destination_allocation_bytes)
++#undef FIELD
++    out+="\"host_budget\":"+std::to_string(state_->host_budget)+",\"gpu_budget\":"+std::to_string(state_->gpu_budget)+",\"fallbacks\":0,\"process_memory\":"+(state_->memory?state_->memory->stats_json():"null")+"}";
++    return out;
++}
++}}
+diff --git a/engine/ggml/src/ggml-ssd/stream/buffer-cache.h b/engine/ggml/src/ggml-ssd/stream/buffer-cache.h
+new file mode 100644
+--- /dev/null
++++ b/engine/ggml/src/ggml-ssd/stream/buffer-cache.h
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "ggml-backend.h"
++#include "store/source.h"
++#include <cstdint>
++#include <memory>
++#include <string>
++
++namespace ssd { namespace stream {
++// Same-build, Windows10/B70-only expert byte transport. Model math stays in
++// the ordinary architecture graph. A configured failure never uses mmap/CPU.
++class buffer_cache {
++public:
++    struct counters {
++        uint64_t ssd_reads=0,ssd_bytes=0,host_hits=0,host_misses=0,host_evictions=0;
++        uint64_t gpu_hits=0,gpu_misses=0,gpu_evictions=0,h2d_bytes=0,d2d_bytes=0,slices=0;
++        uint64_t host_live=0,host_peak=0,gpu_live=0,gpu_peak=0,gpu_reserved=0,gpu_reserved_peak=0,cancellations=0;
++        uint64_t gpu_allocation_bytes=0,gpu_allocation_peak=0,device_local_checks=0,last_destination_allocation_bytes=0;
++    };
++    buffer_cache(store::source_view source,uint64_t host_budget,uint64_t gpu_budget,
++                 uint64_t process_vram_limit=24ULL<<30,uint64_t headroom=1ULL<<30,uint64_t nonlocal_limit=1ULL<<30);
++    ~buffer_cache();
++    buffer_cache(const buffer_cache &)=delete;
++    buffer_cache & operator=(const buffer_cache &)=delete;
++    using source_validator = bool (*)(void *,const ggml_tensor *,int,uint64_t,size_t,int64_t,int) noexcept;
++    void bind_source(source_validator validator,void * userdata);
++    void attach(ggml_backend_t backend);
++    bool prepare_graph(ggml_backend_sched_t scheduler,ggml_cgraph * graph) noexcept;
++    // One owner/context and backend. Each copy finishes its borrowed buffers.
++    int copy(ggml_backend_t backend,const ggml_tensor * source,ggml_tensor * destination,
++             int64_t experts,size_t stride,const int32_t * counts) noexcept;
++    void set_stop(bool (*requested)(void *),void * userdata) noexcept;
++    bool validate_graph(ggml_backend_sched_t scheduler,ggml_cgraph * graph) noexcept;
++    bool observe_memory() noexcept;
++    void invalidate() noexcept;
++    counters stats() const;
++    std::string stats_json() const;
++private:
++    struct impl;
++    std::unique_ptr<impl> state_;
++};
++}}
+diff --git a/engine/ggml/src/ggml-ssd/stream/memory-guard.cpp b/engine/ggml/src/ggml-ssd/stream/memory-guard.cpp
+new file mode 100644
+--- /dev/null
++++ b/engine/ggml/src/ggml-ssd/stream/memory-guard.cpp
+@@ -0,0 +1,85 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "memory-guard.h"
++#if !defined(_WIN32)
++#error "This WDDM guard is Windows-only"
++#endif
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++#include <dxgi1_4.h>
++#include <wrl/client.h>
++#include <algorithm>
++#include <mutex>
++#include <stdexcept>
++#include <string>
++
++namespace ssd { namespace stream {
++using Microsoft::WRL::ComPtr;
++namespace {
++void success(HRESULT result,const char * name){
++    if(FAILED(result))throw std::runtime_error(std::string(name)+" failed: "+std::to_string(uint32_t(result)));
++}
++uint64_t ticks(const FILETIME & value){return (uint64_t(value.dwHighDateTime)<<32)|value.dwLowDateTime;}
++}
++struct memory_guard::impl {
++    ComPtr<IDXGIAdapter3> adapter;
++    DXGI_ADAPTER_DESC1 desc={};
++    const uint64_t local_limit,headroom,nonlocal_limit;
++    DXGI_QUERY_VIDEO_MEMORY_INFO local={},nonlocal={};
++    uint64_t peak_local=0,peak_nonlocal=0,queries=0,creation=0;
++    DWORD pid=0;
++    mutable std::mutex mutex;
++    impl(uint64_t limit,uint64_t spare,uint64_t shared):local_limit(limit),headroom(spare),nonlocal_limit(shared){
++        constexpr uint64_t mib=1ULL<<20;
++        if(limit<1024*mib||limit>28*1024*mib||spare<128*mib||spare>8192*mib||shared>2048*mib)
++            throw std::runtime_error("WDDM process budget outside admission bounds");
++        FILETIME c,e,k,u;
++        if(!GetProcessTimes(GetCurrentProcess(),&c,&e,&k,&u))throw std::runtime_error("Cannot bind WDDM accounting to this process creation identity");
++        pid=GetCurrentProcessId();creation=ticks(c);
++        ComPtr<IDXGIFactory1> factory;
++        success(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())),"CreateDXGIFactory1");
++        for(UINT i=0;i<32;++i){
++            ComPtr<IDXGIAdapter1> candidate;
++            const HRESULT found=factory->EnumAdapters1(i,candidate.GetAddressOf());
++            if(found==DXGI_ERROR_NOT_FOUND)break;
++            success(found,"EnumAdapters1");
++            DXGI_ADAPTER_DESC1 d={};success(candidate->GetDesc1(&d),"GetDesc1");
++            if(d.VendorId!=0x8086||(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)||std::wstring(d.Description).find(L"B70")==std::wstring::npos)continue;
++            if(adapter)throw std::runtime_error("Multiple B70 DXGI adapters require separate qualification");
++            if(d.DedicatedVideoMemory<24ULL*1024*1024*1024)throw std::runtime_error("B70 dedicated-memory identity differs from the qualified machine");
++            success(candidate.As(&adapter),"IDXGIAdapter3 query");desc=d;
++        }
++        if(!adapter)throw std::runtime_error("WDDM B70 adapter missing; no accounting fallback");
++    }
++};
++memory_guard::memory_guard(uint64_t limit,uint64_t spare,uint64_t shared):state_(new impl(limit,spare,shared)){}
++memory_guard::~memory_guard()=default;
++void memory_guard::check(uint64_t planned){
++    auto & s=*state_;std::lock_guard<std::mutex> lock(s.mutex);
++    FILETIME c,e,k,u;
++    if(GetCurrentProcessId()!=s.pid||!GetProcessTimes(GetCurrentProcess(),&c,&e,&k,&u)||ticks(c)!=s.creation)
++        throw std::runtime_error("WDDM process identity mismatch");
++    success(s.adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&s.local),"WDDM local memory query");
++    success(s.adapter->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,&s.nonlocal),"WDDM nonlocal memory query");
++    ++s.queries;s.peak_local=std::max(s.peak_local,s.local.CurrentUsage);s.peak_nonlocal=std::max(s.peak_nonlocal,s.nonlocal.CurrentUsage);
++    if(s.local.Budget<=s.headroom)throw std::runtime_error("WDDM did not provide a usable local-memory budget");
++    const uint64_t allowed=std::min(s.local_limit,s.local.Budget>s.headroom?s.local.Budget-s.headroom:0);
++    if(s.local.CurrentUsage>allowed||planned>allowed-s.local.CurrentUsage)
++        throw std::runtime_error("Owned B70 process exceeds VRAM limit or WDDM headroom; no resize/retry fallback");
++    if(s.nonlocal.CurrentUsage>s.nonlocal_limit)
++        throw std::runtime_error("Owned B70 process exceeds nonlocal GPU-memory limit");
++}
++std::string memory_guard::stats_json()const{
++    const auto & s=*state_;std::lock_guard<std::mutex> lock(s.mutex);
++    return "{\"source\":\"IDXGIAdapter3.QueryVideoMemoryInfo\",\"pid\":"+std::to_string(s.pid)+
++        ",\"creation_filetime\":"+std::to_string(s.creation)+",\"vendor_id\":"+std::to_string(s.desc.VendorId)+
++        ",\"device_id\":"+std::to_string(s.desc.DeviceId)+",\"subsystem_id\":"+std::to_string(s.desc.SubSysId)+
++        ",\"revision\":"+std::to_string(s.desc.Revision)+",\"dedicated_video_memory\":"+std::to_string(uint64_t(s.desc.DedicatedVideoMemory))+
++        ",\"adapter_luid_low\":"+std::to_string(s.desc.AdapterLuid.LowPart)+",\"adapter_luid_high\":"+std::to_string(uint32_t(s.desc.AdapterLuid.HighPart))+
++        ",\"local_current\":"+std::to_string(s.local.CurrentUsage)+",\"local_peak_observed\":"+std::to_string(s.peak_local)+
++        ",\"local_budget\":"+std::to_string(s.local.Budget)+",\"local_limit\":"+std::to_string(s.local_limit)+
++        ",\"headroom\":"+std::to_string(s.headroom)+",\"nonlocal_current\":"+std::to_string(s.nonlocal.CurrentUsage)+
++        ",\"nonlocal_peak_observed\":"+std::to_string(s.peak_nonlocal)+",\"nonlocal_limit\":"+std::to_string(s.nonlocal_limit)+
++        ",\"queries\":"+std::to_string(s.queries)+"}";
++}
++}}
+diff --git a/engine/ggml/src/ggml-ssd/stream/memory-guard.h b/engine/ggml/src/ggml-ssd/stream/memory-guard.h
+new file mode 100644
+--- /dev/null
++++ b/engine/ggml/src/ggml-ssd/stream/memory-guard.h
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <cstdint>
++#include <memory>
++#include <string>
++namespace ssd { namespace stream {
++// Read-only WDDM accounting for this process on the uniquely selected B70.
++// Never changes reservations, driver state, or another process.
++class memory_guard {
++public:
++    memory_guard(uint64_t local_limit,uint64_t headroom,uint64_t nonlocal_limit);
++    ~memory_guard();
++    memory_guard(const memory_guard &)=delete;
++    memory_guard & operator=(const memory_guard &)=delete;
++    void check(uint64_t planned_local_allocation=0);
++    std::string stats_json() const;
++private:
++    struct impl;
++    std::unique_ptr<impl> state_;
++};
++}}
+diff --git a/engine/ggml/src/ggml-ssd/stream/runtime.cpp b/engine/ggml/src/ggml-ssd/stream/runtime.cpp
+--- a/engine/ggml/src/ggml-ssd/stream/runtime.cpp
++++ b/engine/ggml/src/ggml-ssd/stream/runtime.cpp
+@@ -6,6 +6,7 @@
+ #include "copy-plan.h"
+ #include <algorithm>
+ #include <string>
++#include <stdexcept>
+ 
+ namespace ssd { namespace stream {
+ const ggml_backend_sched_ssd_hooks runtime::hooks_{
+@@ -28,6 +29,76 @@
+ };
+ void runtime::attach(ggml_backend_sched_t scheduler) {
+     ggml_backend_sched_set_ssd_runtime(scheduler, &hooks_, this);
++}
++
++void runtime::configure_buffer_cache(uint64_t host,uint64_t gpu,const std::string & stop_file,
++                                     uint64_t process_limit,uint64_t headroom,uint64_t nonlocal_limit) {
++#if defined(_WIN32)
++    if(buffer_cache_||!services_.source||!services_.source->resolve)throw std::runtime_error("B70 cache requires one immutable source index");
++    owned_stop_file_=std::filesystem::u8path(stop_file);
++    buffer_cache_=std::make_unique<buffer_cache>(*services_.source,host,gpu,process_limit,headroom,nonlocal_limit);
++    buffer_cache_->set_stop([](void * opaque)->bool{
++        const auto & self=*static_cast<runtime *>(opaque);
++        std::error_code error;
++        const bool requested=std::filesystem::exists(self.owned_stop_file_,error);
++        return requested||bool(error);
++    },this);
++#else
++    (void)host;(void)gpu;(void)stop_file;(void)process_limit;(void)headroom;(void)nonlocal_limit;throw std::runtime_error("B70 buffer streaming is Windows-only");
++#endif
++}
++bool runtime::buffer_stream_enabled()const noexcept{
++#if defined(_WIN32)
++    return bool(buffer_cache_);
++#else
++    return false;
++#endif
++}
++void runtime::attach_buffer_backend(ggml_backend_t backend){
++#if defined(_WIN32)
++    if(!buffer_cache_)throw std::runtime_error("B70 cache is not configured");
++    buffer_cache_->attach(backend);
++#else
++    (void)backend;throw std::runtime_error("B70 buffer streaming is Windows-only");
++#endif
++}
++void runtime::bind_buffer_source(bool (*validator)(void *,const ggml_tensor *,int,uint64_t,size_t,int64_t,int) noexcept,void * userdata){
++#if defined(_WIN32)
++    if(!buffer_cache_)throw std::runtime_error("B70 cache is not configured");
++    buffer_cache_->bind_source(validator,userdata);
++#else
++    (void)validator;(void)userdata;throw std::runtime_error("B70 buffer source is Windows-only");
++#endif
++}
++bool runtime::prepare_buffer_graph(ggml_backend_sched_t scheduler,ggml_cgraph * graph)noexcept{
++#if defined(_WIN32)
++    return !buffer_cache_||buffer_cache_->prepare_graph(scheduler,graph);
++#else
++    (void)scheduler;(void)graph;return true;
++#endif
++}
++bool runtime::validate_buffer_graph(ggml_backend_sched_t scheduler,ggml_cgraph * graph)noexcept{
++#if defined(_WIN32)
++    return !buffer_cache_||buffer_cache_->validate_graph(scheduler,graph);
++#else
++    (void)scheduler;(void)graph;return true;
++#endif
++}
++
++bool runtime::finish_buffer_graph(bool computation_ok)noexcept{
++#if defined(_WIN32)
++    if(!buffer_cache_)return true;
++    if(!computation_ok){buffer_cache_->invalidate();return false;}
++    std::error_code error;
++    if(std::filesystem::exists(owned_stop_file_,error)||error){buffer_cache_->invalidate();return false;}
++    if(!buffer_cache_->observe_memory())return false;
++    try{
++        if(services_.events&&services_.events->event("ssd.b70.graph_memory",buffer_cache_->stats_json()))return true;
++    }catch(...){}
++    buffer_cache_->invalidate();return false;
++#else
++    (void)computation_ok;return true;
++#endif
+ }
+ 
+ bool runtime::drive_home(const ggml_tensor * tensor) const noexcept {
+@@ -71,6 +142,16 @@
+ 
+ int runtime::copy_experts(ggml_backend_t backend, const ggml_tensor * source, ggml_tensor * destination,
+         int64_t experts, size_t stride, const int32_t * counts) noexcept {
++#if defined(_WIN32)
++    if(buffer_cache_){
++        const int result=buffer_cache_->copy(backend,source,destination,experts,stride,counts);
++        if(result<0)return -1;
++        try{
++            if(services_.events&&!services_.events->event("ssd.b70.cache",buffer_cache_->stats_json()))return -1;
++        }catch(...){return -1;}
++        return result;
++    }
++#endif
+     const auto * gpu = services_.gpu;
+     if (!gpu || !services_.gpu_transport || gpu->device_ordinal(backend) < 0) { return 0; }
+     if (gpu->device_ordinal(backend) != services_.gpu_device) { return -1; }
+diff --git a/engine/ggml/src/ggml-ssd/stream/runtime.h b/engine/ggml/src/ggml-ssd/stream/runtime.h
+--- a/engine/ggml/src/ggml-ssd/stream/runtime.h
++++ b/engine/ggml/src/ggml-ssd/stream/runtime.h
+@@ -3,6 +3,11 @@
+ #include "ggml-backend.h"
+ #include "../runtime-services.h"
+ #include <mutex>
++#include <memory>
++#if defined(_WIN32)
++#include "buffer-cache.h"
++#include <filesystem>
++#endif
+ 
+ namespace ssd { namespace stream {
+ // One request/context owner; the scheduler borrows the table and this object.
+@@ -11,12 +16,24 @@
+ public:
+     explicit runtime(const runtime_services & services) : services_(services) {}
+     void attach(ggml_backend_sched_t scheduler);
++    void configure_buffer_cache(uint64_t host_bytes,uint64_t gpu_bytes,const std::string & stop_file,
++                                uint64_t process_limit,uint64_t headroom,uint64_t nonlocal_limit);
++    bool buffer_stream_enabled() const noexcept;
++    void attach_buffer_backend(ggml_backend_t backend);
++    void bind_buffer_source(bool (*validator)(void *,const ggml_tensor *,int,uint64_t,size_t,int64_t,int) noexcept,void * userdata);
++    bool prepare_buffer_graph(ggml_backend_sched_t scheduler,ggml_cgraph * graph) noexcept;
++    bool validate_buffer_graph(ggml_backend_sched_t scheduler,ggml_cgraph * graph) noexcept;
++    bool finish_buffer_graph(bool computation_ok=true) noexcept;
+ private:
+     static const ggml_backend_sched_ssd_hooks hooks_;
+     const runtime_services & services_;
+     std::mutex mutex_;
+     ggml_backend_sched_kimi_copy_stats stats_{};
+     int phase_ = 0;
++#if defined(_WIN32)
++    std::unique_ptr<buffer_cache> buffer_cache_;
++    std::filesystem::path owned_stop_file_;
++#endif
+     bool drive_home(const ggml_tensor *) const noexcept;
+     bool copy_dense(ggml_backend_t, const ggml_tensor *, ggml_tensor *, const ggml_tensor *, uint64_t) noexcept;
+     int copy_experts(ggml_backend_t, const ggml_tensor *, ggml_tensor *, int64_t, size_t, const int32_t *) noexcept;
+diff --git a/engine/ggml/src/ggml-ssd/telemetry/telemetry.cpp b/engine/ggml/src/ggml-ssd/telemetry/telemetry.cpp
+--- a/engine/ggml/src/ggml-ssd/telemetry/telemetry.cpp
++++ b/engine/ggml/src/ggml-ssd/telemetry/telemetry.cpp
+@@ -98,6 +98,10 @@
+ 
+ result<void> writer::event(const std::string & name, const std::string & payload) noexcept {
+     try {
++        if (payload.size() > 65536 || name.size() > 128) {
++            std::lock_guard<std::mutex> lock(mutex_); failed_ = true;
++            return { status::resource, "telemetry event exceeds its bound" };
++        }
+         if (name.compare(0, 4, "ssd.") != 0 || name.size() == 4 || name.back() == '.') {
+             return { status::invalid, "telemetry event must start with ssd. and name an event" };
+         }
+@@ -129,12 +133,17 @@
+         }
+         const std::string line = "{\"v\":1,\"ev\":" + json::quote(name) + ",\"seq\":" + std::to_string(sequence_) +
+                                  (parsed.value.object.empty() ? "" : "," + body) + "}\n";
++        if (sequence_ >= max_events_ || line.size() > max_bytes_ - bytes_) {
++            failed_ = true;
++            return { status::resource, "telemetry byte/event bound reached" };
++        }
+         // One mutex protects a complete line and its sequence. Flush errors are
+         // reported while the runtime still owns the writer and can fail its arm.
+         if (std::fwrite(line.data(), 1, line.size(), stream_) != line.size() || std::fflush(stream_) != 0) {
+             failed_ = true;
+             return { status::io, "telemetry write/flush failed" };
+         }
++        bytes_ += line.size();
+         ++sequence_;
+         return {};
+     } catch (const std::bad_alloc &) {
+diff --git a/engine/ggml/src/ggml-ssd/telemetry/telemetry.h b/engine/ggml/src/ggml-ssd/telemetry/telemetry.h
+--- a/engine/ggml/src/ggml-ssd/telemetry/telemetry.h
++++ b/engine/ggml/src/ggml-ssd/telemetry/telemetry.h
+@@ -36,6 +36,9 @@
+     std::FILE * stream_ = nullptr;
+     std::mutex  mutex_;
+     uint64_t    sequence_ = 0;
++    uint64_t    bytes_ = 0;
++    static constexpr uint64_t max_bytes_ = 512ULL << 20;
++    static constexpr uint64_t max_events_ = 100000;
+     bool        failed_   = false;
+ };
+ 
+diff --git a/engine/ggml/src/ggml-vulkan/CMakeLists.txt b/engine/ggml/src/ggml-vulkan/CMakeLists.txt
+--- a/engine/ggml/src/ggml-vulkan/CMakeLists.txt
++++ b/engine/ggml/src/ggml-vulkan/CMakeLists.txt
+@@ -35,11 +35,17 @@
+         COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
+         OUTPUT_VARIABLE glslc_output
+         ERROR_VARIABLE glslc_error
+-    )
+-
+-    if (${glslc_error} MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
++        RESULT_VARIABLE glslc_result
++        TIMEOUT 30
++    )
++
++    if (NOT "${glslc_result}" STREQUAL "0" AND
++        "${glslc_result}" MATCHES "^[0-9]+$" AND
++        "${glslc_error}" MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
+         message(STATUS "${EXTENSION_NAME} not supported by glslc")
+         set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
++    elseif (NOT "${glslc_result}" STREQUAL "0")
++        message(FATAL_ERROR "Finite shader feature probe failed (${glslc_result}) for ${EXTENSION_NAME}: ${glslc_error}")
+     else()
+         message(STATUS "${EXTENSION_NAME} supported by glslc")
+         set(${RESULT_VARIABLE} ON PARENT_SCOPE)
+@@ -177,6 +183,14 @@
+ 
+     file(GLOB _ggml_vk_shader_files CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.comp")
+ 
++    # A CPP embeds multiple conditional shader variants. Track the complete
++    # shader/include tree so every variant's includes and future additions are
++    # represented by CMake's native path quoting. No Make depfile is consumed.
++    file(GLOB_RECURSE _ggml_vk_shader_dependencies CONFIGURE_DEPENDS
++        "${_ggml_vk_input_dir}/*.comp"
++        "${_ggml_vk_input_dir}/*.glsl"
++        "${_ggml_vk_input_dir}/*.h")
++
+     # Because external projects do not provide source-level tracking,
+     # the vulkan-shaders-gen sources need to be explicitly added to
+     # ensure that changes will cascade into shader re-generation.
+@@ -191,6 +205,7 @@
+             --output-dir ${_ggml_vk_output_dir}
+             --target-hpp ${_ggml_vk_header}
+         DEPENDS ${_ggml_vk_shaders_gen_sources}
++                ${_ggml_vk_shader_dependencies}
+                 vulkan-shaders-gen
+         COMMENT "Generate vulkan shaders header"
+     )
+@@ -202,7 +217,6 @@
+ 
+         add_custom_command(
+             OUTPUT  ${_ggml_vk_target_cpp}
+-            DEPFILE ${_ggml_vk_target_cpp}.d
+             COMMAND ${_ggml_vk_genshaders_cmd}
+                 --glslc      ${Vulkan_GLSLC_EXECUTABLE}
+                 --source     ${file_full}
+@@ -211,6 +225,7 @@
+                 --target-cpp ${_ggml_vk_target_cpp}
+             DEPENDS ${file_full}
+                     ${_ggml_vk_shaders_gen_sources}
++                    ${_ggml_vk_shader_dependencies}
+                     vulkan-shaders-gen
+             COMMENT "Generate vulkan shaders for ${file}"
+         )
+diff --git a/engine/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/engine/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+--- a/engine/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/engine/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -624,6 +624,7 @@
+     uint32_t shader_core_count;
+     bool uma;
+     bool prefer_host_memory;
++    bool b70_strict_device_memory = false;
+     bool float_controls_rte_fp16;
+     bool subgroup_basic;
+     bool subgroup_arithmetic;
+@@ -929,20 +930,26 @@
+     vk::Buffer buffer = VK_NULL_HANDLE;
+     vk::DeviceMemory device_memory = VK_NULL_HANDLE;
+     vk::MemoryPropertyFlags memory_property_flags;
+-    void * ptr;
++    vk::MemoryPropertyFlags allocation_property_flags;
++    uint64_t allocation_bytes = 0;
++    uint32_t memory_type_index = UINT32_MAX;
++    bool imported_host = false;
++    void * ptr = nullptr;
++    bool mapped = false;
+     size_t size = 0;
+     vk::DeviceAddress bda_addr {};
+ 
+     vk_device device;
+ 
+     ~vk_buffer_struct() {
+-        if (size == 0) {
+-            return;
+-        }
++        // Own each handle immediately, including partially constructed buffers.
++        if (!device) { return; }
+         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
+-
+-        device->device.freeMemory(device_memory);
+-        device->device.destroyBuffer(buffer);
++        if (buffer) { device->device.destroyBuffer(buffer); }
++        if (device_memory) {
++            if (mapped) { device->device.unmapMemory(device_memory); }
++            device->device.freeMemory(device_memory);
++        }
+     }
+ };
+ 
+@@ -2650,13 +2657,15 @@
+ }
+ 
+ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
+-                                       void *import_ptr = nullptr) {
++                                       void *import_ptr = nullptr, uint64_t allocation_limit = UINT64_MAX) {
++    try {
+     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
+     if (size > device->max_buffer_size) {
+         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
+     }
+ 
+     vk_buffer buf = std::make_shared<vk_buffer_struct>();
++    buf->device = device;
+ 
+     if (size == 0) {
+         buf->size = 0;
+@@ -2688,6 +2697,11 @@
+     buf->buffer = device->device.createBuffer(buffer_create_info);
+ 
+     vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
++    // The exact driver requirement is available before any VkDeviceMemory allocation.
++    // Cache arenas call this with their remaining physical allocation allowance.
++    if (mem_req.size > allocation_limit) {
++        throw std::runtime_error("Vulkan physical allocation would exceed its explicit allowance");
++    }
+ 
+     vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+ 
+@@ -2705,7 +2719,7 @@
+             host_pointer_props = device->device.getMemoryHostPointerPropertiesEXT(vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT, import_ptr);
+         } catch (vk::SystemError& e) {
+             GGML_LOG_WARN("ggml_vulkan: Failed getMemoryHostPointerPropertiesEXT (%s)\n", e.what());
+-            device->device.destroyBuffer(buf->buffer);
++            
+             return {};
+         }
+         vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+@@ -2729,7 +2743,7 @@
+         }
+         if (memory_type_idx == 32) {
+             GGML_LOG_WARN("ggml_vulkan: Memory type for host allocation not found\n");
+-            device->device.destroyBuffer(buf->buffer);
++            
+             return {};
+         }
+ 
+@@ -2740,6 +2754,10 @@
+             import_info.pHostPointer = import_ptr;
+             import_info.setPNext(&mem_flags_info);
+             buf->device_memory = device->device.allocateMemory({ size, memory_type_idx, &import_info });
++            buf->allocation_bytes = size;
++            buf->memory_type_index = memory_type_idx;
++            buf->allocation_property_flags = mem_props.memoryTypes[memory_type_idx].propertyFlags;
++            buf->imported_host = true;
+         } catch (const vk::SystemError& e) {
+         }
+     } else {
+@@ -2758,13 +2776,20 @@
+             for (auto mtype_it = memory_type_indices.begin(); mtype_it != memory_type_indices.end(); mtype_it++) {
+                 try {
+                     buf->device_memory = device->device.allocateMemory({ mem_req.size, *mtype_it, &mem_flags_info });
++                    buf->allocation_bytes = mem_req.size;
++                    buf->memory_type_index = *mtype_it;
++                    buf->allocation_property_flags = mem_props.memoryTypes[*mtype_it].propertyFlags;
+                     done = true;
+                     break;
+                 } catch (const vk::SystemError& e) {
++                    if (device->b70_strict_device_memory) {
++                        
++                        throw; // No second memory type/allocation attempt after a B70 infrastructure error.
++                    }
+                     // loop and retry
+                     // during last attempt throw the exception
+                     if (it + 1 == req_flags_list.end() && mtype_it + 1 == memory_type_indices.end()) {
+-                        device->device.destroyBuffer(buf->buffer);
++                        
+                         throw e;
+                     }
+                 }
+@@ -2777,7 +2802,7 @@
+     }
+ 
+     if (!buf->device_memory) {
+-        device->device.destroyBuffer(buf->buffer);
++        
+         throw vk::OutOfDeviceMemoryError("No suitable memory type found");
+     }
+ 
+@@ -2788,6 +2813,7 @@
+     } else {
+         if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+             buf->ptr = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
++            buf->mapped = true;
+         }
+     }
+ 
+@@ -2804,6 +2830,15 @@
+     device->memory_logger->log_allocation(buf, size);
+ 
+     return buf;
++    } catch (const vk::SystemError & error) {
++        if (device->b70_strict_device_memory) {
++            // ggml's allocator can reserve/retry after a nullptr. An owned B70 run
++            // ends here instead, before any caller can make another GPU attempt.
++            GGML_LOG_ERROR("B70 terminal Vulkan allocation/construction failure: %s\n", error.what());
++            std::abort();
++        }
++        throw;
++    }
+ }
+ 
+ static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::MemoryPropertyFlags req_flags, vk::MemoryPropertyFlags fallback_flags = vk::MemoryPropertyFlags(0)) {
+@@ -2816,10 +2851,24 @@
+     }
+ }
+ 
+-static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
++static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size, uint64_t allocation_limit = UINT64_MAX) {
+     vk_buffer buf;
+     try {
+-        if (device->prefer_host_memory) {
++        if (device->b70_strict_device_memory) {
++            if (device->uma) { throw std::runtime_error("Strict B70 requires discrete memory"); }
++            buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal}, nullptr, allocation_limit);
++            // Empty optional scratch slots have no Vulkan allocation to classify.
++            // Keep every positive allocation subject to the original strict check.
++            if (size == 0) {
++                if (buf->size != 0 || buf->buffer || buf->device_memory || buf->allocation_bytes != 0 ||
++                    buf->memory_type_index != UINT32_MAX || buf->imported_host || buf->ptr ||
++                    buf->mapped || buf->bda_addr != 0) {
++                    throw std::runtime_error("Strict B70 empty scratch metadata unexpectedly owns memory");
++                }
++            } else if (!(buf->allocation_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal) || buf->imported_host) {
++                throw std::runtime_error("Strict B70 device allocation is not local dedicated storage");
++            }
++        } else if (device->prefer_host_memory) {
+             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                                                        vk::MemoryPropertyFlagBits::eDeviceLocal});
+         } else if (device->uma) {
+@@ -2895,6 +2944,21 @@
+     );
+ }
+ 
++// Host-coherent memory still requires a device-to-host memory dependency.
++static void ggml_vk_sync_b70_host_read(vk_device& device, vk_context& subctx) {
++    if (!device->b70_strict_device_memory) {
++        return;
++    }
++    subctx->s->buffer->buf.pipelineBarrier(
++        vk::PipelineStageFlagBits::eTransfer,
++        vk::PipelineStageFlagBits::eHost,
++        {},
++        { { vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead } },
++        {},
++        {}
++    );
++}
++
+ static void ggml_vk_reset_event(vk_context& ctx, vk::Event& event) {
+     VK_LOG_DEBUG("ggml_vk_set_event()");
+ 
+@@ -3140,6 +3204,12 @@
+ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& state) {
+     return {state.workgroup_size, state.Br, state.Bc, state.HSK, state.HSV, !state.aligned, state.D_split,
+             state.row_split, state.subgroup_size, state.shmem_staging ? 1u : 0u, state.flags, state.limit_occupancy_shmem};
++}
++
++// Matrix shader selection and shared-memory admission must use the same
++// arithmetic width. Physical F16 storage support remains enabled separately.
++static bool ggml_vk_matmul_fp16_arithmetic(const vk_device& device) {
++    return device->fp16 && !device->b70_strict_device_memory;
+ }
+ 
+ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
+@@ -3180,7 +3250,7 @@
+ 
+     // Needs to be kept up to date on shader changes
+     const uint32_t bank_conflict_offset = device->coopmat_support ? 8 : 1;
+-    const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
++    const uint32_t type_size = ggml_vk_matmul_fp16_arithmetic(device) ? sizeof(ggml_fp16_t) : sizeof(float);
+     const uint32_t warps = warptile[0] / warptile[10];
+ 
+     const uint32_t load_bufs = (warptile[1] + warptile[2]) * (warptile[3] + bank_conflict_offset) * type_size;
+@@ -3812,7 +3882,7 @@
+ #undef CREATE_MM
+     } else
+ #endif  // defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+-    if (device->fp16) {
++    if (ggml_vk_matmul_fp16_arithmetic(device)) {
+         // Create 6 variants, {s,m,l}x{unaligned,aligned}
+ #define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
+         if (device->mul_mat ## ID ## _l[TYPE]) \
+@@ -3990,6 +4060,9 @@
+ #undef CREATE_MMQ
+ #undef CREATE_MM
+     } else {
++        if (device->b70_strict_device_memory) {
++            std::cerr << "ggml_vulkan: strict B70 matrix SPV suffix=_fp32 shared_memory_element_bytes=4" << std::endl;
++        }
+         // Create 6 variants, {s,m,l}x{unaligned,aligned}
+ #define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID, REQSUBGROUPSIZE) \
+         if (device->mul_mat ## ID ## _l[TYPE]) \
+@@ -4922,14 +4995,24 @@
+ 
+         device->architecture = get_device_architecture(device->physical_device);
+ 
++#ifdef _WIN32
++        const auto b70_properties = device->physical_device.getProperties();
++        device->b70_strict_device_memory = b70_properties.vendorID == 0x8086 &&
++            b70_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu &&
++            std::string(b70_properties.deviceName.data()).find("B70") != std::string::npos;
++        if (device->b70_strict_device_memory &&
++            (getenv("GGML_VK_PREFER_HOST_MEMORY") || getenv("GGML_VK_ALLOW_SYSMEM_FALLBACK"))) {
++            throw std::runtime_error("Strict Windows/B70 rejects host-preference and system-memory fallback environment flags");
++        }
++#endif
+         const char* GGML_VK_PREFER_HOST_MEMORY = getenv("GGML_VK_PREFER_HOST_MEMORY");
+-        device->prefer_host_memory = GGML_VK_PREFER_HOST_MEMORY != nullptr;
++        device->prefer_host_memory = !device->b70_strict_device_memory && GGML_VK_PREFER_HOST_MEMORY != nullptr;
+ 
+         const char* GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM = getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM");
+         device->disable_host_visible_vidmem = GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM != nullptr;
+ 
+         const char* GGML_VK_ALLOW_SYSMEM_FALLBACK = getenv("GGML_VK_ALLOW_SYSMEM_FALLBACK");
+-        device->allow_sysmem_fallback = GGML_VK_ALLOW_SYSMEM_FALLBACK != nullptr;
++        device->allow_sysmem_fallback = !device->b70_strict_device_memory && GGML_VK_ALLOW_SYSMEM_FALLBACK != nullptr;
+ 
+         const char* GGML_VK_DISABLE_GRAPH_OPTIMIZE = getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE");
+         device->disable_graph_optimize = GGML_VK_DISABLE_GRAPH_OPTIMIZE != nullptr;
+@@ -5162,10 +5245,16 @@
+         const bool allow_graphics_queue = (getenv("GGML_VK_ALLOW_GRAPHICS_QUEUE") != nullptr);
+         const vk::QueueFlagBits graphics_flag = allow_graphics_queue ? (vk::QueueFlagBits)0 : vk::QueueFlagBits::eGraphics;
+         const uint32_t compute_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eCompute, graphics_flag, -1, 1);
+-        const uint32_t transfer_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | graphics_flag, compute_queue_family_index, 1);
++        // Strict B70 uses one queue for Exclusive buffers; no cross-family ownership transfers.
++        const uint32_t transfer_queue_family_index = device->b70_strict_device_memory ? compute_queue_family_index :
++            ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | graphics_flag, compute_queue_family_index, 1);
+ 
+         const float priorities[] = { 1.0f, 1.0f };
+-        device->single_queue = compute_queue_family_index == transfer_queue_family_index && queue_family_props[compute_queue_family_index].queueCount == 1;
++        device->single_queue = device->b70_strict_device_memory ||
++            (compute_queue_family_index == transfer_queue_family_index && queue_family_props[compute_queue_family_index].queueCount == 1);
++        if (device->b70_strict_device_memory) {
++            std::cerr << "ggml_vulkan: strict B70 compute/transfer family=" << compute_queue_family_index << " queue=0" << std::endl;
++        }
+ 
+         std::vector<vk::DeviceQueueCreateInfo> device_queue_create_infos;
+         if (compute_queue_family_index != transfer_queue_family_index) {
+@@ -5552,6 +5641,18 @@
+         device_create_info.setPNext(&device_features2);
+         device->device = device->physical_device.createDevice(device_create_info);
+ 
++        // Strict B70 numerical mode changes library routing, not enabled Vulkan
++        // storage features. Keep stored F16 weights usable, but do not introduce
++        // activation quantization or cooperative-matrix F16 operands.
++        if (device->b70_strict_device_memory) {
++            device->coopmat_support = false;
++            device->coopmat2 = false;
++            device->coopmat1_fa_support = false;
++            device->coopmat_int_support = false;
++            device->integer_dot_product = false;
++            std::cerr << "ggml_vulkan: strict B70 numerical routing: cooperative_matrices=0 activation_requantization=0 F32_accumulation_required=1" << std::endl;
++        }
++
+         // Queues
+         ggml_vk_create_queue(device, device->compute_queue, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
+ 
+@@ -6163,6 +6264,7 @@
+ }
+ 
+ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
++    if (ctx->device->b70_strict_device_memory) { prec = GGML_PREC_F32; }
+     VK_LOG_DEBUG("ggml_vk_get_mul_mat_mat_pipeline(" << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ", " << prec << ")");
+     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
+         return ctx->device->pipeline_matmul_f32;
+@@ -6327,6 +6429,7 @@
+ }
+ 
+ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
++    if (ctx->device->b70_strict_device_memory) { prec = GGML_PREC_F32; }
+     VK_LOG_DEBUG("ggml_vk_get_mul_mat_mat_id_pipeline()");
+     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
+         return ctx->device->pipeline_matmul_id_f32;
+@@ -6396,6 +6499,13 @@
+     bool prefer_fp16acc = ctx->device->fp16 /*&& prec == GGML_PREC_DEFAULT*/;
+     bool support_fp16acc = !mmp.f16acc->is_empty();
+     bool support_fp32acc = !mmp.f32acc->is_empty();
++
++    // Strict B70: the production-size prefill must meet the frozen scalar gate.
++    // Require F32 accumulation; never silently substitute lower accumulation precision.
++    if (ctx->device->b70_strict_device_memory) {
++        GGML_ASSERT(support_fp32acc);
++        return mmp.f32acc;
++    }
+ 
+     if (support_fp16acc && (prefer_fp16acc || !support_fp32acc)) {
+         return mmp.f16acc;
+@@ -6999,6 +7109,7 @@
+         // Memory is pinned, use as staging buffer
+         ggml_vk_sync_buffers(nullptr, subctx);
+         subctx->s->buffer->buf.copyBuffer(src->buffer, buf->buffer, slices);
++        ggml_vk_sync_b70_host_read(src->device, subctx);
+ 
+         return true;
+     }
+@@ -7017,6 +7128,7 @@
+ 
+     ggml_vk_sync_buffers(nullptr, subctx);
+     subctx->s->buffer->buf.copyBuffer(src->buffer, staging_buffer->buffer, slices);
++    ggml_vk_sync_b70_host_read(src->device, subctx);
+ 
+     deferred_memcpy(dst, staging_buffer->ptr, copy_size, &subctx->out_memcpys);
+     return true;
+@@ -7073,6 +7185,10 @@
+         // Copy within the device
+         vk_context subctx = ggml_vk_create_temporary_context(src->device->transfer_queue.cmd_pool);
+         ggml_vk_ctx_begin(src->device, subctx);
++        if (src->device->b70_strict_device_memory) {
++            // Make prior uploads/copies visible before reading the cache resident.
++            ggml_vk_sync_buffers(nullptr, subctx);
++        }
+         ggml_vk_buffer_copy_async(subctx, dst, dst_offset, src, src_offset, size);
+         ggml_vk_ctx_end(subctx);
+         ggml_vk_submit(subctx, src->device->fence);
+@@ -7559,8 +7675,14 @@
+                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
+                               !ggml_vk_dim01_contiguous(src1);
+ 
+-    // If src0 is BF16, try to use a BF16 x BF16 multiply
+-    ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
++    // Preserve F32 activations when copying strided inputs for an existing
++    // F32 or Q8_0/F32 matrix pipeline. Quantized weights remain encoded; all
++    // precision-preserving fallback assertions below still apply.
++    const bool b70_keep_f32_copy = ctx->device->b70_strict_device_memory &&
++                                   (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_Q8_0) &&
++                                   src1->type == GGML_TYPE_F32;
++    ggml_type f16_type = b70_keep_f32_copy ? GGML_TYPE_F32 :
++                         (src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16);
+ 
+     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
+ 
+@@ -7577,6 +7699,14 @@
+ 
+     const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
+     const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
++    if (ctx->device->b70_strict_device_memory) {
++        // Reject unimplemented precision-preserving fallbacks. Never silently
++        // narrow F32 activations or dequantize quantized weights through F16.
++        GGML_ASSERT(!quantize_y);
++        GGML_ASSERT(src0->type != GGML_TYPE_F32 || !qx_needs_dequant || f16_type == GGML_TYPE_F32);
++        GGML_ASSERT(src1->type != GGML_TYPE_F32 || !qy_needs_dequant || f16_type == GGML_TYPE_F32);
++        GGML_ASSERT(!ggml_is_quantized(src0->type) || !qx_needs_dequant);
++    }
+ 
+     if (qx_needs_dequant) {
+         // Fall back to dequant + f16 mulmat
+@@ -7593,6 +7723,18 @@
+ 
+     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
++    }
++    if (ctx->device->b70_strict_device_memory) {
++        GGML_ASSERT(pipeline != nullptr);
++        std::cerr << "ggml_vulkan: strict B70 selected MUL_MAT pipeline=" << pipeline->name
++                  << " K=" << ne00 << " M=" << ne01 << " T=" << ne11
++                  << " A=" << ggml_type_name(src0->type) << " B=" << ggml_type_name(src1->type)
++                  << " requantized=" << quantize_y << " x_copy=" << qx_needs_dequant
++                  << " y_copy=" << qy_needs_dequant << " temporary_type=" << ggml_type_name(f16_type)
++                  << " preserve_F32_copy=" << b70_keep_f32_copy
++                  << " effective_A=" << ggml_type_name(qx_needs_dequant ? f16_type : src0->type)
++                  << " effective_B=" << ggml_type_name(qy_needs_dequant ? f16_type : src1->type)
++                  << " full_f32_spv=" << !ggml_vk_matmul_fp16_arithmetic(ctx->device) << std::endl;
+     }
+ 
+     // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
+@@ -7606,8 +7748,8 @@
+ 
+     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
+     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
+-    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
+-    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
++    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : ggml_type_size(f16_type) * x_ne;
++    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : ggml_type_size(f16_type) * y_ne);
+     const uint64_t d_sz = sizeof(float) * d_ne;
+ 
+     vk_pipeline to_fp16_vk_0 = nullptr;
+@@ -7911,6 +8053,16 @@
+ 
+     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+         dmmv = ggml_vk_get_64b_indexing_pipeline(ctx, dmmv);
++    }
++    if (ctx->device->b70_strict_device_memory) {
++        GGML_ASSERT(dmmv != nullptr && !quantize_y);
++        std::cerr << "ggml_vulkan: strict B70 selected MUL_MAT_VEC pipeline=" << dmmv->name
++                  << " K=" << ne00 << " M=" << ne01 << " columns=" << ne11
++                  << " A=" << ggml_type_name(src0->type) << " B=" << ggml_type_name(src1->type)
++                  << " requantized=" << quantize_y << " x_copy=" << x_non_contig
++                  << " y_copy=" << y_non_contig
++                  << " effective_A=" << ggml_type_name(src0->type)
++                  << " effective_B=" << ggml_type_name(src1->type) << std::endl;
+     }
+ 
+     const bool qx_needs_dequant = x_non_contig;
+@@ -8412,6 +8564,14 @@
+ 
+     const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
+     const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
++    if (ctx->device->b70_strict_device_memory) {
++        // Reject unimplemented precision-preserving fallbacks. Never silently
++        // narrow F32 activations or dequantize quantized weights through F16.
++        GGML_ASSERT(!quantize_y);
++        GGML_ASSERT(src0->type != GGML_TYPE_F32 || !qx_needs_dequant || f16_type == GGML_TYPE_F32);
++        GGML_ASSERT(src1->type != GGML_TYPE_F32 || !qy_needs_dequant || f16_type == GGML_TYPE_F32);
++        GGML_ASSERT(!ggml_is_quantized(src0->type) || !qx_needs_dequant);
++    }
+ 
+     if (qx_needs_dequant) {
+         // Fall back to dequant + f16 mulmat
+@@ -8422,12 +8582,25 @@
+     GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
+ 
+     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_id_pipeline_align(ctx, mmp, ne01, nei1, qx_needs_dequant ? f16_type : src0->type));
+-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
++    // Strict B70: routed N can be smaller than BN; use the bounds-checked B loads.
++    const bool aligned = !ctx->device->b70_strict_device_memory &&
++                         !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
+ 
+     vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, aligned, qx_needs_dequant ? f16_type : src0->type);
+ 
+     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
++    }
++    if (ctx->device->b70_strict_device_memory) {
++        GGML_ASSERT(pipeline != nullptr);
++        std::cerr << "ggml_vulkan: strict B70 selected MUL_MAT_ID pipeline=" << pipeline->name
++                  << " K=" << ne00 << " M=" << ne01 << " T=" << nei1
++                  << " input_ranks=" << ne11 << " aligned=" << aligned
++                  << " requantized=" << quantize_y << " x_copy=" << qx_needs_dequant
++                  << " y_copy=" << qy_needs_dequant
++                  << " effective_A=" << ggml_type_name(qx_needs_dequant ? f16_type : src0->type)
++                  << " effective_B=" << ggml_type_name(qy_needs_dequant ? f16_type : src1->type)
++                  << " full_f32_spv=" << !ggml_vk_matmul_fp16_arithmetic(ctx->device) << std::endl;
+     }
+     // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
+     uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) :ne11;
+@@ -13024,6 +13197,11 @@
+     }
+ 
+     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
++    if (ctx->device->b70_strict_device_memory) {
++        // Include uploads/D2D and any async work already recorded in this context.
++        // A conservative per-node barrier also covers the first shader/ID count.
++        ggml_vk_sync_buffers(ctx, compute_ctx);
++    }
+ 
+     {
+         // This logic detects dependencies between modes in the graph and calls ggml_vk_sync_buffers
+@@ -13763,13 +13941,13 @@
+     return ctx->name.c_str();
+ }
+ 
+-static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
++static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer_limited(ggml_backend_buffer_type_t buft, size_t size, uint64_t allocation_limit) {
+     VK_LOG_MEMORY("ggml_backend_vk_buffer_type_alloc_buffer(" << size << ")");
+     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+ 
+     vk_buffer dev_buffer = nullptr;
+     try {
+-        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
++        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size, allocation_limit);
+     } catch (const vk::SystemError& e) {
+         return nullptr;
+     }
+@@ -13777,6 +13955,10 @@
+     ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
+ 
+     return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
++}
++
++static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
++    return ggml_backend_vk_buffer_type_alloc_buffer_limited(buft, size, UINT64_MAX);
+ }
+ 
+ static size_t ggml_backend_vk_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+@@ -13982,6 +14164,7 @@
+         buffer_cpy.size = size;
+ 
+         compute_ctx->s->buffer->buf.copyBuffer(buf->buffer, ctx->sync_staging->buffer, { buffer_cpy });
++        ggml_vk_sync_b70_host_read(ctx->device, compute_ctx);
+         deferred_memcpy(data, ctx->sync_staging->ptr, size, &compute_ctx->out_memcpys);
+         ggml_vk_synchronize(ctx);
+     }
+@@ -14924,20 +15107,32 @@
+         return;
+     }
+ 
+-    auto const &is_empty = [](ggml_tensor * node) -> bool {
++    auto const &is_empty = [](const ggml_tensor * node) -> bool {
+         return node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
+     };
+ 
+-    auto const &is_src_of = [](const ggml_tensor *dst, const ggml_tensor *src) -> bool {
++    auto const &is_src_of = [&is_empty](const ggml_tensor *dst, const ggml_tensor *src) -> bool {
++        auto const &base = [](const ggml_tensor * tensor) {
++            return tensor->view_src ? tensor->view_src : tensor;
++        };
+         for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+             if (dst->src[s] == src) {
+                 return true;
+             }
++            if (is_empty(dst) || is_empty(src)) {
++                continue;
++            }
++            // A source view of dst may read storage written through a different view by src.
++            if (dst->src[s] && base(dst->src[s]) == base(src)) {
++                return true;
++            }
++            // Moving dst forward may overwrite storage still read through a view by src.
++            if (src->src[s] && base(dst) == base(src->src[s])) {
++                return true;
++            }
+         }
+         // implicit dependency if they view the same tensor
+-        const ggml_tensor *dst2 = dst->view_src ? dst->view_src : dst;
+-        const ggml_tensor *src2 = src->view_src ? src->view_src : src;
+-        if (dst2 == src2) {
++        if (base(dst) == base(src)) {
+             return true;
+         }
+         return false;
+@@ -16075,6 +16270,7 @@
+ }
+ 
+ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size) {
++    if (device->b70_strict_device_memory) { return {}; }
+     if (!device->external_memory_host) {
+         return {};
+     }
+@@ -16181,8 +16377,39 @@
+     return devices[device];
+ }
+ 
++static bool ggml_backend_vk_query_buffer_memory(ggml_backend_buffer_t buffer, ggml_backend_vk_buffer_memory_info_v1 * info) {
++    if (!buffer || !info || info->version != 1 || info->size != sizeof(*info) ||
++        !ggml_backend_buffer_is_vk(buffer) || !buffer->context) { return false; }
++    const auto * ctx = static_cast<ggml_backend_vk_buffer_context *>(buffer->context);
++    const auto device = ctx->device.lock();
++    if (!device || !ctx->dev_buffer) { return false; }
++    const auto & data = *ctx->dev_buffer;
++    info->buffer_bytes = buffer->size;
++    info->allocation_bytes = data.allocation_bytes;
++    info->memory_type_index = data.memory_type_index;
++    info->property_flags = static_cast<uint32_t>(static_cast<VkMemoryPropertyFlags>(data.allocation_property_flags));
++    info->device_local = bool(data.allocation_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal);
++    info->host_visible = bool(data.allocation_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
++    info->imported_host = data.imported_host;
++    info->strict_device_memory = device->b70_strict_device_memory;
++    return info->allocation_bytes > 0 && info->memory_type_index != UINT32_MAX;
++}
++
++static ggml_backend_buffer_t ggml_backend_vk_alloc_bounded(ggml_backend_t backend, size_t size, uint64_t allowance) {
++    if (!backend || !ggml_backend_is_vk(backend) || !allowance) { return nullptr; }
++    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
++    if (!ctx || !ctx->device->b70_strict_device_memory) { return nullptr; }
++    return ggml_backend_vk_buffer_type_alloc_buffer_limited(ggml_backend_get_default_buffer_type(backend), size, allowance);
++}
++
+ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
++    if (strcmp(name, "ggml_backend_vk_alloc_bounded_v1") == 0) {
++        return (void *) ggml_backend_vk_alloc_bounded;
++    }
++    if (strcmp(name, "ggml_backend_vk_buffer_memory_query_v1") == 0) {
++        return (void *) ggml_backend_vk_query_buffer_memory;
++    }
+     if (strcmp(name, "ggml_backend_ssd_provider_v1") == 0) {
+         return (void *) ssd::gpu::graph_lane_provider;
+     }
+diff --git a/engine/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/engine/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+--- a/engine/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/engine/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -15,6 +15,7 @@
+ #include <cstring>
+ #include <cstdlib>
+ #include <cassert>
++#include <cerrno>
+ #include <algorithm>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+@@ -80,55 +81,57 @@
+ 
+ void execute_command(std::vector<std::string>& command, std::string& stdout_str, std::string& stderr_str) {
+ #ifdef _WIN32
+-    HANDLE stdout_read, stdout_write;
+-    HANDLE stderr_read, stderr_write;
+-    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+-
+-    if (!CreatePipe(&stdout_read, &stdout_write, &sa, 0) ||
+-        !SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0)) {
+-        throw std::runtime_error("Failed to create stdout pipe");
+-    }
+-
+-    if (!CreatePipe(&stderr_read, &stderr_write, &sa, 0) ||
+-        !SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0)) {
+-        throw std::runtime_error("Failed to create stderr pipe");
+-    }
+-
+-    PROCESS_INFORMATION pi;
++    // No shell: pass the actual compiler image and quote every CRT argument.
++    // Inherit only this build's standard streams; the enclosing owner job
++    // confines all descendants and bounds the combined log size.
++    const auto quote = [](const std::string & arg) {
++        std::string out = "\"";
++        size_t backslashes = 0;
++        for (char c : arg) {
++            if (c == '\\') { ++backslashes; continue; }
++            if (c == '"') { out.append(backslashes * 2 + 1, '\\'); out += c; }
++            else { out.append(backslashes, '\\'); out += c; }
++            backslashes = 0;
++        }
++        out.append(backslashes * 2, '\\'); out += '"';
++        return out;
++    };
++    if (command.empty()) { throw std::runtime_error("Empty compiler command"); }
++    std::string cmd;
++    for (const auto & part : command) {
++        if (!cmd.empty()) { cmd += ' '; }
++        cmd += quote(part);
++    }
++    PROCESS_INFORMATION pi = {};
+     STARTUPINFOA si = {};
+-    si.cb = sizeof(STARTUPINFOA);
++    si.cb = sizeof(si);
+     si.dwFlags = STARTF_USESTDHANDLES;
+-    si.hStdOutput = stdout_write;
+-    si.hStdError = stderr_write;
+-
+-    std::string cmd;
+-    for (const auto& part : command) {
+-        cmd += part + " ";
+-    }
+-
+-    if (!CreateProcessA(NULL, cmd.data(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+-        throw std::runtime_error("Failed to create process");
+-    }
+-
+-    CloseHandle(stdout_write);
+-    CloseHandle(stderr_write);
+-
+-    std::array<char, 128> buffer;
+-    DWORD bytes_read;
+-
+-    while (ReadFile(stdout_read, buffer.data(), (DWORD)buffer.size(), &bytes_read, NULL) && bytes_read > 0) {
+-        stdout_str.append(buffer.data(), bytes_read);
+-    }
+-
+-    while (ReadFile(stderr_read, buffer.data(), (DWORD)buffer.size(), &bytes_read, NULL) && bytes_read > 0) {
+-        stderr_str.append(buffer.data(), bytes_read);
+-    }
+-
+-    CloseHandle(stdout_read);
+-    CloseHandle(stderr_read);
+-    WaitForSingleObject(pi.hProcess, INFINITE);
+-    CloseHandle(pi.hProcess);
+-    CloseHandle(pi.hThread);
++    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
++    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
++    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
++    if (!CreateProcessA(command.front().c_str(), cmd.data(), nullptr, nullptr, TRUE,
++                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
++        throw std::runtime_error("Cannot create owned shader compiler: " + std::to_string(GetLastError()));
++    }
++    struct close_process {
++        PROCESS_INFORMATION & pi;
++        ~close_process() { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
++    } cleanup{pi};
++    const DWORD waited = WaitForSingleObject(pi.hProcess, 60000);
++    if (waited != WAIT_OBJECT_0) {
++        // Only the retained child handle created above is stopped. This is a
++        // failed build; no artifact is admitted and no retry is performed.
++        if (!TerminateProcess(pi.hProcess, 1) || WaitForSingleObject(pi.hProcess, 5000) != WAIT_OBJECT_0) {
++            throw std::runtime_error("Owned shader compiler failed to clean up");
++        }
++        throw std::runtime_error("Owned shader compiler exceeded its finite wait");
++    }
++    DWORD code = 0;
++    if (!GetExitCodeProcess(pi.hProcess, &code) || code != 0) {
++        throw std::runtime_error("Shader compiler failed: " + std::to_string(code));
++    }
++    (void) stdout_str;
++    (void) stderr_str;
+ #else
+     int stdout_pipe[2];
+     int stderr_pipe[2];
+@@ -253,40 +256,75 @@
+ std::string read_binary_file(const std::string& path, bool may_not_exist = false) {
+     FILE* f = fopen(path.c_str(), "rb");
+     if (!f) {
+-        if (!may_not_exist) {
+-            std::cerr << "Error opening file: " << path << " (" << strerror(errno) << ")\n";
+-        }
+-        return {};
+-    }
+-
+-    fseek(f, 0, SEEK_END);
+-    size_t size = ftell(f);
+-    fseek(f, 0, SEEK_SET);
+-
+-    std::string data(size, '\0');
+-    size_t read_size = fread(data.data(), 1, size, f);
+-    fclose(f);
+-    if (read_size != size) {
+-        std::cerr << "Error reading file: " << path << " (" << strerror(errno) << ")\n";
+-        return {};
+-    }
+-
+-    return data;
++        if (may_not_exist && errno == ENOENT) { return {}; }
++        throw std::runtime_error("Cannot open shader input: " + path);
++    }
++    try {
++        if (fseek(f, 0, SEEK_END) != 0) { throw std::runtime_error("Shader input seek failed: " + path); }
++        const long length = ftell(f);
++        if (length < 0 || static_cast<uint64_t>(length) > (256ULL << 20)) {
++            throw std::runtime_error("Shader input size is invalid or exceeds the bounded file size: " + path);
++        }
++        if (fseek(f, 0, SEEK_SET) != 0) { throw std::runtime_error("Shader input rewind failed: " + path); }
++        std::string data(static_cast<size_t>(length), '\0');
++        if (fread(data.data(), 1, data.size(), f) != data.size() || ferror(f)) {
++            throw std::runtime_error("Shader input read failed: " + path);
++        }
++        const int closed = fclose(f); f = nullptr;
++        if (closed != 0) { throw std::runtime_error("Shader input close failed: " + path); }
++        return data;
++    } catch (...) {
++        if (f) { fclose(f); }
++        throw;
++    }
+ }
+ 
+ void write_binary_file(const std::string& path, const std::string& content) {
+-    FILE* f = fopen(path.c_str(), "wb");
+-    if (!f) {
+-        std::cerr << "Error opening file for writing: " << path << " (" << strerror(errno) << ")\n";
+-        return;
+-    }
+-
+-    size_t write_size = fwrite(content.data(), 1, content.size(), f);
+-    fclose(f);
+-    if (write_size != content.size()) {
+-        std::cerr << "Error writing file: " << path << " (" << strerror(errno) << ")\n";
+-        return;
+-    }
++    if (content.size() > (256ULL << 20)) { throw std::runtime_error("Generated file exceeds admission bound"); }
++    // Preserve failed temporaries. A fresh qualified build cannot reuse them.
++    const std::string pending = path + ".pending";
++#ifdef _WIN32
++    HANDLE f = CreateFileA(pending.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (f == INVALID_HANDLE_VALUE) { throw std::runtime_error("Cannot exclusively create generated temporary: " + pending); }
++    try {
++        size_t offset = 0;
++        while (offset < content.size()) {
++            const DWORD requested = static_cast<DWORD>(std::min<size_t>(content.size() - offset, 1U << 20));
++            DWORD written = 0;
++            if (!WriteFile(f, content.data() + offset, requested, &written, nullptr) || written == 0 || written > requested) {
++                throw std::runtime_error("Generated file write failed: " + pending);
++            }
++            offset += written;
++        }
++        if (!FlushFileBuffers(f)) { throw std::runtime_error("Generated file flush failed: " + pending); }
++        const BOOL closed = CloseHandle(f); f = INVALID_HANDLE_VALUE;
++        if (!closed) { throw std::runtime_error("Generated file close failed: " + pending); }
++        if (!MoveFileExA(pending.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
++            throw std::runtime_error("Generated file atomic publication failed: " + pending);
++        }
++    } catch (...) {
++        if (f != INVALID_HANDLE_VALUE) { CloseHandle(f); }
++        throw;
++    }
++#else
++    int f = open(pending.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
++    if (f < 0) { throw std::runtime_error("Cannot exclusively create generated temporary: " + pending); }
++    try {
++        size_t offset = 0;
++        while (offset < content.size()) {
++            const ssize_t written = write(f, content.data() + offset, std::min<size_t>(content.size() - offset, 1U << 20));
++            if (written <= 0) { throw std::runtime_error("Generated file write failed: " + pending); }
++            offset += static_cast<size_t>(written);
++        }
++        if (fsync(f) != 0) { throw std::runtime_error("Generated file flush failed: " + pending); }
++        const int closed = close(f); f = -1;
++        if (closed != 0) { throw std::runtime_error("Generated file close failed: " + pending); }
++        if (rename(pending.c_str(), path.c_str()) != 0) { throw std::runtime_error("Generated file atomic publication failed: " + pending); }
++    } catch (...) {
++        if (f >= 0) { close(f); }
++        throw;
++    }
++#endif
+ }
+ 
+ void write_file_if_changed(const std::string& path, const std::string& content) {
+@@ -301,7 +339,6 @@
+ static uint32_t compile_count = 0;
+ static std::mutex compile_count_mutex;
+ static std::condition_variable compile_count_cond;
+-static bool generate_dep_file = true;
+ 
+ void decrement_compile_count(uint32_t * count) {
+     if (count) {
+@@ -317,18 +354,18 @@
+ compile_count_guard acquire_compile_slot() {
+     // wait until fewer than N compiles are in progress.
+     // 16 is an arbitrary limit, the goal is to avoid "failed to create pipe" errors.
+-    uint32_t N = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
++    uint32_t N = 1; // Private bounded build: one shader compiler at a time.
+     std::unique_lock<std::mutex> guard(compile_count_mutex);
+     compile_count_cond.wait(guard, [N] { return compile_count < N; });
+     compile_count++;
+     return compile_count_guard(&compile_count, &decrement_compile_count);
+ }
+ 
+-void string_to_spv_func(std::string name, std::string in_path, std::string out_path, std::map<std::string, std::string> defines, bool coopmat, bool dep_file, compile_count_guard slot) {
++void string_to_spv_func(std::string name, std::string in_path, std::string out_path, std::map<std::string, std::string> defines, bool coopmat, compile_count_guard slot) {
+     std::string target_env = (name.find("_cm2") != std::string::npos) ? "--target-env=vulkan1.3" : "--target-env=vulkan1.2";
+ 
+     #ifdef _WIN32
+-        std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, "\"" + in_path + "\"", "-o", "\"" + out_path + "\""};
++        std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, in_path, "-o", out_path};
+     #else
+         std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, in_path, "-o", out_path};
+     #endif
+@@ -338,16 +375,6 @@
+     // disable spirv-opt for rope shaders for https://github.com/ggml-org/llama.cpp/issues/16860
+     if (!coopmat && name.find("bf16") == std::string::npos && name.find("rope") == std::string::npos) {
+         cmd.push_back("-O");
+-    }
+-
+-    if (dep_file) {
+-        cmd.push_back("-MD");
+-        cmd.push_back("-MF");
+-#ifdef _WIN32
+-        cmd.push_back("\"" + target_cpp + ".d\"");
+-#else
+-        cmd.push_back(target_cpp + ".d");
+-#endif
+     }
+ 
+     #ifdef GGML_VULKAN_SHADER_DEBUG_INFO
+@@ -378,25 +405,14 @@
+                 std::cerr << part << " ";
+             }
+             std::cerr << "\n\n" << stderr_str << std::endl;
+-            return;
+-        }
+-
+-        if (dep_file) {
+-            // replace .spv output path with the embed .cpp path which is used as output in CMakeLists.txt
+-            std::string dep = read_binary_file(target_cpp + ".d", true);
+-            if (!dep.empty()) {
+-                size_t pos = dep.find(out_path);
+-                if (pos != std::string::npos) {
+-                    dep.replace(pos, out_path.length(), target_cpp);
+-                }
+-                write_binary_file(target_cpp + ".d", dep);
+-            }
++            throw std::runtime_error("Shader compiler diagnostics indicate failure");
+         }
+ 
+         std::lock_guard<std::mutex> guard(lock);
+         shader_fnames.push_back(std::make_pair(name, out_path));
+     } catch (const std::exception& e) {
+         std::cerr << "Error executing command for " << name << ": " << e.what() << std::endl;
++        throw;
+     }
+ }
+ 
+@@ -406,7 +422,6 @@
+     return result;
+ }
+ 
+-static std::vector<std::future<void>> compiles;
+ void string_to_spv(std::string name, const std::string& source, const std::map<std::string, std::string>& defines, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false, const std::string& suffix = "") {
+     name = name + (f16acc ? "_f16acc" : "") + (coopmat ? "_cm1" : "") + (coopmat2 ? "_cm2" : (fp16 ? "" : "_fp32")) + suffix;
+     std::string out_path = join_paths(output_dir, name + ".spv");
+@@ -421,10 +436,9 @@
+     }
+ 
+     compile_count_guard slot = acquire_compile_slot();
+-    compiles.push_back(std::async(
+-        string_to_spv_func, name, input_filepath, out_path, defines, coopmat, generate_dep_file, std::move(slot)));
+-    // Don't write the same dep file from multiple processes
+-    generate_dep_file = false;
++    // Finish and observe this exact compiler before admitting another.
++    // A launch/timeout/compiler failure unwinds immediately; no later variants.
++    string_to_spv_func(name, input_filepath, out_path, defines, coopmat, std::move(slot));
+ }
+ 
+ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool coopmat2, bool f16acc) {
+@@ -1032,12 +1046,10 @@
+ 
+     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
+ 
+-    for (auto &c : compiles) {
+-        c.wait();
+-    }
+ }
+ 
+ void write_output_files() {
++    if (shader_fnames.empty()) { throw std::runtime_error("No matching shader outputs; refusing empty generated file"); }
+     std::stringstream hdr = make_generic_stringstream();
+     std::stringstream src = make_generic_stringstream();
+ 
+@@ -1059,8 +1071,8 @@
+ 
+         if (input_filepath != "") {
+             std::string data = read_binary_file(path);
+-            if (data.empty()) {
+-                continue;
++            if (data.size() < 20 || data.size() % 4 != 0 || std::memcmp(data.data(), "\x03\x02\x23\x07", 4) != 0) {
++                throw std::runtime_error("Missing or invalid SPIR-V; refusing generated output");
+             }
+ 
+             src << "const uint64_t " << name << "_len = " << data.size() << ";\n";
+@@ -1202,9 +1214,12 @@
+         }
+     }
+ 
+-    process_shaders();
+-
+-    write_output_files();
+-
+-    return EXIT_SUCCESS;
+-}
++    try {
++        process_shaders();
++        write_output_files();
++        return EXIT_SUCCESS;
++    } catch (const std::exception & error) {
++        std::cerr << "Shader generation failed; no artifacts admitted: " << error.what() << "\n";
++        return EXIT_FAILURE;
++    }
++}
+diff --git a/engine/include/llama-ssd.h b/engine/include/llama-ssd.h
+--- a/engine/include/llama-ssd.h
++++ b/engine/include/llama-ssd.h
+@@ -19,6 +19,11 @@
+     const char * settings_file, const struct llama_ssd_override * overrides,
+     size_t count, const char * telemetry_file, char * error, size_t error_size);
+ LLAMA_API void llama_ssd_options_free(struct llama_ssd_options * options);
++// Private Windows/B70 path. Settings remain immutable; prepare retains the
++// device/buffer-selection arrays until the model load returns. Invoke once.
++LLAMA_API bool llama_ssd_options_b70_stream(const struct llama_ssd_options * options);
++LLAMA_API bool llama_ssd_options_b70_prepare_model(struct llama_ssd_options * options,
++    struct llama_model_params * model_params,char * error,size_t error_size);
+ // Startup guard, including callers which did not request SSD execution.
+ LLAMA_API bool llama_ssd_check_environment(char * error, size_t error_size);
+ 
+diff --git a/engine/include/llama.h b/engine/include/llama.h
+--- a/engine/include/llama.h
++++ b/engine/include/llama.h
+@@ -320,6 +320,7 @@
+         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
+         bool no_host;         // bypass host buffer allowing extra buffers to be used
+         bool defer_experts;   // defer expert mmap residency to avoid eager host RSS growth
++        bool b70_buffer_stream; // private explicit Windows/B70 mapped expert-weight transport
+         bool no_alloc;        // only load metadata and simulate memory allocations
+     };
+ 
+diff --git a/engine/src/llama-context.cpp b/engine/src/llama-context.cpp
+--- a/engine/src/llama-context.cpp
++++ b/engine/src/llama-context.cpp
+@@ -46,10 +46,29 @@
+     cvec(std::make_unique<llama_adapter_cvec>()),
+     loras(std::make_unique<llama_adapter_loras>()),
+     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
++    const bool model_b70=model.b70_buffer_stream_enabled();
++    const bool context_b70=ssd_runtime&&ssd_runtime->stream.buffer_stream_enabled();
++    if(model_b70!=context_b70 || (model_b70&&!model.has_b70_expert_catalog())){
++        throw std::runtime_error("Loaded model and context must agree on the exact B70 streaming mode/catalog");
++    }
+     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
+     //     may need to be backend-dependent
+     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+ 
++    if(ssd_runtime&&ssd_runtime->stream.buffer_stream_enabled()){
++        if(!params.ssd_options->b70_model_prepared||params.n_ctx==0||params.n_ctx>4096||
++           params.n_batch==0||params.n_batch>64||params.n_ubatch==0||params.n_ubatch>32||params.n_seq_max!=1||
++           params.n_threads<1||params.n_threads>2||params.n_threads_batch<1||params.n_threads_batch>2){
++            throw std::runtime_error("B70 context requires prepared model parameters and explicit bounded context/batches/threads");
++        }
++    }
++    if(ssd_runtime&&ssd_runtime->stream.buffer_stream_enabled()){
++        if(!model.has_b70_expert_catalog())throw std::runtime_error("B70 context requires its actual native loaded-model catalog");
++        ssd_runtime->stream.bind_buffer_source([](void * data,const ggml_tensor * tensor,int fd,uint64_t offset,
++                size_t stride,int64_t experts,int expert)noexcept{
++            return static_cast<const llama_model *>(data)->validate_b70_expert(tensor,fd,offset,stride,experts,expert);
++        },const_cast<llama_model *>(&model));
++    }
+     t_start_us = model.t_start_us;
+     t_load_us  = model.t_load_us;
+ 
+@@ -192,7 +211,9 @@
+ 
+     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+ 
+-    cpu_sink_enabled = ssd_runtime && !ssd_runtime->settings.sources()->empty();
++    // A separately admitted B70 transport keeps the native architecture graph.
++    // The existing CPU-SSD adapter admission below remains unchanged.
++    cpu_sink_enabled = ssd_runtime && !ssd_runtime->settings.sources()->empty() && !ssd_runtime->stream.buffer_stream_enabled();
+     dense_gpu_phase_gate_enabled = cpu_sink_enabled;
+     if (cpu_sink_enabled) {
+         if (llama_ssd::describe_experts(model.arch, model.hparams, -1).activation ==
+@@ -481,6 +502,9 @@
+             sampling.token_ids_full_vocab[i] = i;
+         }
+     }
++    if(ssd_runtime&&ssd_runtime->stream.buffer_stream_enabled()&&!ssd_runtime->stream.finish_buffer_graph()){
++        throw std::runtime_error("B70 construction stop/memory/telemetry gate failed");
++    }
+ }
+ 
+ llama_context::~llama_context() {
+@@ -494,6 +518,9 @@
+     }
+     // Graph nodes borrow this context's runtime. Complete their work before
+     // releasing cache pages, worker threads, and the backend API pointers.
++    if(ssd_runtime&&ssd_runtime->stream.buffer_stream_enabled()){
++        for(const auto & backend:backends)ggml_backend_synchronize(backend.get());
++    }
+     if (cpu_sink_runtime) {
+         if (sched) { synchronize(); }
+         cpu_sink_runtime.reset();
+@@ -1771,6 +1798,9 @@
+             return nullptr;
+         }
+ 
++        if(ssd_runtime&&!ssd_runtime->stream.prepare_buffer_graph(sched.get(),gf)){
++            ret=GGML_STATUS_FAILED;return nullptr;
++        }
+         // The managed scheduler cannot grow implicitly. Reserve the real graph
+         // under the same admission path used for worst-case load-time graphs.
+         const bool allocated = cpu_sink_runtime ?
+@@ -2888,6 +2918,7 @@
+ }
+ 
+ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill) {
++    if(ssd_runtime&&!ssd_runtime->stream.prepare_buffer_graph(sched.get(),graph)){return false;}
+     if (!cpu_sink_runtime) { return ggml_backend_sched_reserve(sched.get(), graph); }
+     ggml_backend_sched_set_auto_reserve(sched.get(), false);
+     ggml_backend_sched_set_host_prefault(sched.get(), llama_host_page_size());
+@@ -2981,6 +3012,7 @@
+     auto * gf = model.build_graph(gparams);
+ 
+ 
++    if(split_only&&ssd_runtime&&!ssd_runtime->stream.prepare_buffer_graph(sched.get(),gf)){return nullptr;}
+     // initialize scheduler with the specified graph
+     if (split_only) {
+         if (sizes) {
+@@ -3196,8 +3228,19 @@
+     const bool graph_profile = ssd_runtime && ssd_runtime->diagnostics.profile_enabled();
+     const int64_t t_submit_start_us = graph_profile ? ggml_time_us() : 0;
+     ggml_backend_sched_kimi_set_profile_phase(sched.get(), batched ? 1 : 2);
++    if(ssd_runtime&&!ssd_runtime->stream.validate_buffer_graph(sched.get(),gf)){
++        LLAMA_LOG_ERROR("%s: B70 graph admission failed; no fallback\n",__func__);return GGML_STATUS_FAILED;
++    }
+     if (mctx) { mctx->submit_precompute(); }
+     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
++    if(ssd_runtime&&ssd_runtime->stream.buffer_stream_enabled()){
++        // This qualification path is synchronous. It does not retain borrowed
++        // cache/source buffers beyond a fence or hide memory failures in a queue.
++        ggml_backend_sched_synchronize(sched.get());
++        if(!ssd_runtime->stream.finish_buffer_graph(status==GGML_STATUS_SUCCESS)){
++            LLAMA_LOG_ERROR("%s: B70 stop/memory/telemetry gate failed; no fallback\n",__func__);status=GGML_STATUS_FAILED;
++        }
++    }
+     ggml_backend_sched_kimi_set_profile_phase(sched.get(), 0);
+     if (graph_profile) {
+         const auto published = ssd_runtime->diagnostics.graph(true,
+diff --git a/engine/src/llama-context.h b/engine/src/llama-context.h
+--- a/engine/src/llama-context.h
++++ b/engine/src/llama-context.h
+@@ -356,6 +356,9 @@
+ 
+     const llama_model & model;
+ 
++    // Backends must outlive the scheduler, expert cache and CPU executor.
++    // Declaration order also protects construction-failure unwinding.
++    std::vector<ggml_backend_ptr> backends;
+     std::unique_ptr<llama_ssd_context> ssd_runtime;
+ 
+     llama_cparams cparams;
+@@ -450,7 +453,6 @@
+     bool sched_need_reserve = true;
+ 
+     ggml_backend_t backend_cpu = nullptr;
+-    std::vector<ggml_backend_ptr> backends;
+ 
+     // training
+     ggml_opt_context_t opt_ctx = nullptr;
+diff --git a/engine/src/llama-model-loader.cpp b/engine/src/llama-model-loader.cpp
+--- a/engine/src/llama-model-loader.cpp
++++ b/engine/src/llama-model-loader.cpp
+@@ -1211,7 +1211,7 @@
+         // overridden: never a repacked, host or device copy.
+         uint32_t expert_layer = 0;
+         const bool plain_mmap = (get_arch() == LLM_ARCH_QWEN4EXP && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD) ||
+-            (map_deferred_experts && llama_is_expert_tensor_name(tn.str(), expert_layer));
++            (map_deferred_experts && is_deferred_expert_name(tn.str(), expert_layer));
+         if (plain_mmap) {
+             buft = ggml_backend_cpu_buffer_type();
+         }
+@@ -1651,7 +1651,7 @@
+                 uint32_t expert_layer = 0;
+                 if (!drop_mmap_tensor_after_upload && drop_gpu_dense_sources && target_buffer &&
+                         !ggml_backend_buffer_is_host(target_buffer) &&
+-                        !llama_is_expert_tensor_name(ggml_get_name(cur), expert_layer)) {
++                        !is_deferred_expert_name(ggml_get_name(cur), expert_layer)) {
+                     gpu_dense_ranges.at(weight->idx).push_back({ weight->offs, weight->offs + n_size });
+                 }
+                 if (drop_mmap_tensor_after_upload) {
+diff --git a/engine/src/llama-model-loader.h b/engine/src/llama-model-loader.h
+--- a/engine/src/llama-model-loader.h
++++ b/engine/src/llama-model-loader.h
+@@ -102,6 +102,7 @@
+     bool use_direct_io = false;
+     bool check_tensors;
+     bool defer_experts = false;
++    bool b70_defer_weight_only = false;
+     // Set by load_tensors while expert loading is deferred for an SSD executor: the
+     // routed-expert tensors take the plain CPU buffer type, an ordinary mmap.
+     bool map_deferred_experts = false;
+@@ -217,6 +218,7 @@
+ 
+     void build_expert_tensor_index(const llama_hparams & hparams);
+     bool should_defer_expert_mmaps() const;
++    bool is_deferred_expert_name(const std::string & name, uint32_t & layer) const;
+     void drop_mmap_expert_pages() const;
+ 
+     std::map<size_t, std::pair<size_t, size_t>> ple_lazy_ranges;
+diff --git a/engine/src/llama-model.cpp b/engine/src/llama-model.cpp
+--- a/engine/src/llama-model.cpp
++++ b/engine/src/llama-model.cpp
+@@ -1,6 +1,8 @@
+ #include "llama-model.h"
+ #include "ssd/model-adapter.h"
+ #include "ssd/model-pages.h"
++#include "ssd/model-source.h"
++#include "ggml-ssd/platform/file.h"
+ 
+ #include "llama-arch.h"
+ #include "llama-ext.h"
+@@ -675,6 +677,14 @@
+     // model memory mapped files
+     llama_mmaps mappings;
+     std::vector<std::vector<llama_file_range>> expert_mmap_ranges;
++    struct b70_expert_record {
++        ssd::platform::file_identity file;
++        const ggml_tensor * tensor = nullptr;
++        uint64_t offset = 0;
++        size_t bytes = 0, stride = 0;
++    };
++    std::vector<ssd::platform::file_identity> b70_files;
++    std::map<std::string,b70_expert_record> b70_experts;
+ 
+     // objects representing data potentially being locked in memory
+     llama_mlocks mlock_bufs;
+@@ -3577,7 +3587,10 @@
+     // Deferred routed experts stay in plain mmap-backed CPU buffers, with or without GPU layers: Kimi's, and those
+     // of every architecture the SSD expert adapter describes, which the SSD executor reads from the drive. A
+     // repacked or device copy would hold every expert in memory.
+-    ml.map_deferred_experts = defer_expert_mmap && (llama_should_map_kimi_experts(arch, name) ||
++    if (params.b70_buffer_stream && (!defer_expert_mmap || !ml.b70_defer_weight_only)) {
++        throw std::runtime_error("B70 expert mmap deferral must remain active");
++    }
++    ml.map_deferred_experts = defer_expert_mmap && (params.b70_buffer_stream || llama_should_map_kimi_experts(arch, name) ||
+         llama_ssd::describe_experts(arch, hparams, -1).activation != llama_ssd::expert_activation::unsupported);
+     if (ml.map_deferred_experts) {
+         LLAMA_LOG_INFO("%s: keeping deferred expert tensors in mapped CPU buffers (arch=%s name='%s')\n",
+@@ -8764,6 +8777,27 @@
+         }
+     }
+ 
++    if (params.b70_buffer_stream) {
++        if (!params.devices || !params.devices[0] || params.devices[1] || ml.files.size()>1024) {
++            throw std::runtime_error("B70 requires exactly one selected device and bounded model files");
++        }
++        for (const auto & file : ml.files) {
++            ssd::platform::file_identity id;
++            if (!ssd::platform::identity(file->file_id(),id)) { throw std::runtime_error("Cannot identify loaded GGUF file"); }
++            pimpl->b70_files.push_back(id);
++        }
++        for (const auto & item : ml.ctx_map) {
++            auto buft=item.first;
++            for (auto * t=ggml_get_first_tensor(item.second.get());t;t=ggml_get_next_tensor(item.second.get(),t)) {
++                uint32_t layer=0;
++                const bool deferred=ml.is_deferred_expert_name(t->name,layer);
++                if ((deferred && buft!=ggml_backend_cpu_buffer_type()) ||
++                    (!deferred && (ggml_backend_buft_get_device(buft)!=params.devices[0] || ggml_backend_buft_is_host(buft)))) {
++                    throw std::runtime_error("B70 model storage selected an unadmitted buffer; no fallback");
++                }
++            }
++        }
++    }
+     ml.init_mappings(!defer_expert_mmap, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+     if (defer_expert_mmap) {
+@@ -8973,6 +9007,33 @@
+                 ml.expert_tensor_index.deferred_bytes / 1024.0 / 1024.0 / 1024.0);
+     }
+ 
++    if (params.b70_buffer_stream) {
++        for (size_t i=0;i<ml.files.size();++i) {
++            ssd::platform::file_identity now;
++            if (!ssd::platform::identity(ml.files[i]->file_id(),now) || now!=pimpl->b70_files.at(i)) {
++                throw std::runtime_error("Loaded GGUF file changed during model loading");
++            }
++        }
++        for (const auto & named : tensors_by_name) {
++            uint32_t layer=0;
++            if (!ml.is_deferred_expert_name(named.first,layer)) { continue; }
++            const auto * t=named.second;
++            const auto & weight=ml.require_weight(named.first.c_str());
++            if (!t->data || t->ne[2]!=hparams.n_expert || t->ne[3]!=1 || !ggml_is_contiguous(t) ||
++                // Deferred sources must be the exact GGUF mapped buffers created above.
++                !t->buffer || mapped_bufs.count(t->buffer)!=1 || !ggml_backend_buffer_is_host(t->buffer) ||
++                ggml_backend_buffer_get_usage(t->buffer)!=GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
++                t->data!=static_cast<char *>(ml.mappings.at(weight.idx)->addr())+weight.offs ||
++                ggml_nbytes(t)!=ggml_nbytes(weight.tensor) || pimpl->b70_experts.size()>=8192) {
++                throw std::runtime_error("Loaded expert is not its exact plain GGUF matrix mapping");
++            }
++            impl::b70_expert_record record;
++            record.file=pimpl->b70_files.at(weight.idx);record.tensor=t;record.offset=weight.offs;
++            record.bytes=ggml_nbytes(t);record.stride=t->nb[2];
++            if (!pimpl->b70_experts.emplace(named.first,record).second) { throw std::runtime_error("Duplicate native expert catalog entry"); }
++        }
++        if (pimpl->b70_experts.empty()) { throw std::runtime_error("Native B70 expert catalog is empty"); }
++    }
+     ml.tensor_buft_overrides = original_tensor_buft_overrides;
+ 
+     if (use_mmap_buffer) {
+@@ -9002,6 +9063,28 @@
+         }
+     }
+     return false;
++}
++
++bool llama_model::b70_buffer_stream_enabled() const noexcept {
++    return params.b70_buffer_stream;
++}
++bool llama_model::has_b70_expert_catalog() const noexcept {
++    return params.b70_buffer_stream&&!pimpl->b70_experts.empty();
++}
++bool llama_model::validate_b70_expert(const ggml_tensor * t,int fd,uint64_t offset,
++                                      size_t stride,int64_t experts,int expert) const noexcept {
++    try {
++        if (!params.b70_buffer_stream || !t || expert<0 || experts<=0 || expert>=experts) { return false; }
++        const auto found=pimpl->b70_experts.find(t->name);
++        if (found==pimpl->b70_experts.end()) { return false; }
++        const auto & record=found->second;
++        if (t!=record.tensor || stride!=record.stride || t->ne[2]!=experts || t->ne[3]!=1 ||
++            !ggml_is_contiguous(t) || ggml_nbytes(t)!=record.bytes || uint64_t(expert)>UINT64_MAX/stride ||
++            record.offset>UINT64_MAX-uint64_t(expert)*stride || offset!=record.offset+uint64_t(expert)*stride) { return false; }
++        ssd::platform::file_identity now;
++        return ssd::platform::is_direct(fd) && ssd::platform::identity(fd,now) && now==record.file &&
++            offset<=now.size && stride<=now.size-offset;
++    } catch (...) { return false; }
+ }
+ 
+ void llama_model::drop_expert_mmap_pages_after_prompt() const {
+@@ -10092,6 +10175,7 @@
+         /*.use_extra_bufts             =*/ true,
+         /*.no_host                     =*/ false,
+         /*.defer_experts               =*/ false,
++        /*.b70_buffer_stream           =*/ false,
+         /*.no_alloc                    =*/ false,
+     };
+ 
+diff --git a/engine/src/llama-model.h b/engine/src/llama-model.h
+--- a/engine/src/llama-model.h
++++ b/engine/src/llama-model.h
+@@ -692,6 +692,10 @@
+ 
+     // whether a weight's bytes are the model's file mapping (mmap): reading them brings file pages into the page cache
+     bool file_mapped(const ggml_tensor * t) const;
++    bool b70_buffer_stream_enabled() const noexcept;
++    bool has_b70_expert_catalog() const noexcept;
++    bool validate_b70_expert(const ggml_tensor * tensor,int fd,uint64_t offset,
++                             size_t stride,int64_t experts,int expert) const noexcept;
+ 
+     std::string arch_name() const;
+     std::string type_name() const;
+diff --git a/engine/src/llama.cpp b/engine/src/llama.cpp
+--- a/engine/src/llama.cpp
++++ b/engine/src/llama.cpp
+@@ -139,6 +139,36 @@
+             model.load_hparams(ml);
+         } catch(const std::exception & e) {
+             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
++        }
++        if (params.b70_buffer_stream) {
++#if !defined(_WIN32)
++            throw std::runtime_error("Private B70 transport requires Windows");
++#endif
++            if (!params.defer_experts || !params.use_mmap || params.use_direct_io || params.use_mlock ||
++                    params.check_tensors || params.use_extra_bufts || params.no_alloc || params.vocab_only ||
++                    !params.no_host || model.hparams.n_expert < 2 ||
++                    (model.arch != LLM_ARCH_LLAMA && model.arch != LLM_ARCH_OPENAI_MOE && model.arch != LLM_ARCH_QWEN3NEXT)) {
++                throw std::runtime_error("Model architecture/parameters lack explicit B70 transport admission");
++            }
++            if (!params.devices || !params.devices[0] || params.devices[1] ||
++                    params.split_mode!=LLAMA_SPLIT_MODE_NONE || params.main_gpu!=0 || params.tensor_split ||
++                    params.n_gpu_layers!=INT32_MAX) {
++                throw std::runtime_error("B70 model requires one explicit device, full layer offload and no device splitting");
++            }
++            const auto device=params.devices[0];
++            const auto registry=ggml_backend_dev_backend_reg(device);
++            const char * backend_name=ggml_backend_reg_name(registry);
++            const char * description=ggml_backend_dev_description(device);
++            bool registered=false;
++            for(size_t i=0;i<ggml_backend_reg_dev_count(registry);++i){registered|=ggml_backend_reg_dev_get(registry,i)==device;}
++            if (!registered || !backend_name || std::string(backend_name)!="Vulkan" || !description ||
++                    std::string(description).find("Intel")==std::string::npos || std::string(description).find("B70")==std::string::npos ||
++                    ggml_backend_dev_type(device)!=GGML_BACKEND_DEVICE_TYPE_GPU ||
++                    !ggml_backend_reg_get_proc_address(registry,"ggml_backend_vk_buffer_memory_query_v1") ||
++                    !ggml_backend_reg_get_proc_address(registry,"ggml_backend_vk_alloc_bounded_v1")) {
++                throw std::runtime_error("B70 model selected a different device/backend or incompatible private memory interface; no fallback");
++            }
++            ml.b70_defer_weight_only = true;
+         }
+         if (params.defer_experts && params.use_mmap) {
+             ml.build_expert_tensor_index(model.hparams);
+diff --git a/engine/src/ssd/model-source.cpp b/engine/src/ssd/model-source.cpp
+--- a/engine/src/ssd/model-source.cpp
++++ b/engine/src/ssd/model-source.cpp
+@@ -45,6 +45,14 @@
+     return true;
+ }
+ 
++bool llama_model_loader::is_deferred_expert_name(const std::string & name, uint32_t & layer) const {
++    if (!llama_is_expert_tensor_name(name, layer)) { return false; }
++    // GPT-OSS's two-dimensional expert biases are small dense GPU weights.
++    // Only the contiguous three-dimensional matrix planes use this transport.
++    return !b70_defer_weight_only ||
++        (name.size() >= 7 && name.compare(name.size()-7,7,".weight") == 0);
++}
++
+ void llama_model_loader::build_expert_tensor_index(const llama_hparams & hparams) {
+     expert_tensor_index = {};
+ 
+@@ -60,7 +68,7 @@
+         const llama_tensor_weight & weight = it.second;
+ 
+         uint32_t layer = 0;
+-        if (!llama_is_expert_tensor_name(name, layer)) {
++        if (!is_deferred_expert_name(name, layer)) {
+             continue;
+         }
+         if (layer >= hparams.n_layer) {
+@@ -70,6 +78,10 @@
+             throw std::runtime_error(format("expert tensor '%s' has invalid file index %u", name.c_str(), (unsigned) weight.idx));
+         }
+ 
++        if (b70_defer_weight_only && (weight.tensor->ne[2] != hparams.n_expert || weight.tensor->ne[3] != 1 ||
++                !ggml_is_contiguous(weight.tensor))) {
++            throw std::runtime_error("B70 requires exact contiguous three-dimensional expert weight planes");
++        }
+         const size_t tensor_bytes = ggml_nbytes(weight.tensor);
+         deferred_bytes += tensor_bytes;
+         expert_tensor_index.file_ranges[weight.idx].push_back({ weight.offs, weight.offs + tensor_bytes });
+@@ -95,7 +107,7 @@
+         for (const auto & [name, weight] : weights_map) {
+             uint32_t layer = 0;
+             if (weight.idx == idx && weight.offs < last && first < weight.offs + ggml_nbytes(weight.tensor) &&
+-                    llama_is_expert_tensor_name(name, layer) && ggml_get_tensor(ctx, name.c_str()) == nullptr) {
++                    is_deferred_expert_name(name, layer) && ggml_get_tensor(ctx, name.c_str()) == nullptr) {
+                 return true;
+             }
+         }
+diff --git a/engine/src/ssd/options.cpp b/engine/src/ssd/options.cpp
+--- a/engine/src/ssd/options.cpp
++++ b/engine/src/ssd/options.cpp
+@@ -12,6 +12,7 @@
+ #include <stdexcept>
+ #include <mutex>
+ #include <limits>
++#include <filesystem>
+ #if defined(__APPLE__)
+ #include <crt_externs.h>
+ #elif defined(_WIN32)
+@@ -100,6 +101,86 @@
+ 
+ void llama_ssd_options_free(llama_ssd_options * options) { delete options; }
+ 
++#if defined(_WIN32)
++namespace {
++bool b70_load_progress(float progress,void * opaque)noexcept{
++    auto & self=*static_cast<llama_ssd_options *>(opaque);
++    if(self.b70_load_failed)return false;
++    try{
++        std::error_code error;
++        if(std::filesystem::exists(self.b70_stop_file,error)||error)throw std::runtime_error("Owned stop requested during B70 model loading");
++        if(!self.b70_load_memory)throw std::runtime_error("B70 load-time WDDM guard is missing");
++        self.b70_load_memory->check();
++        if(self.b70_prior_progress&&!self.b70_prior_progress(progress,self.b70_prior_progress_data))throw std::runtime_error("Caller cancelled B70 model loading");
++        if(progress>=1.0f)std::fprintf(stderr,"[b70.load.memory] %s\n",self.b70_load_memory->stats_json().c_str());
++        return true;
++    }catch(const std::exception & error){
++        self.b70_load_failed=true;std::fprintf(stderr,"[b70.load] admission failed: %.512s\n",error.what());return false;
++    }catch(...){self.b70_load_failed=true;return false;}
++}
++}
++#endif
++
++bool llama_ssd_options_b70_stream(const llama_ssd_options * options){
++    const auto * enabled=options?options->settings.integer("expert.b70_buffer_stream"):nullptr;
++    return enabled&&*enabled==1;
++}
++bool llama_ssd_options_b70_prepare_model(llama_ssd_options * options,llama_model_params * params,char * error,size_t error_size){
++    error_text(error,error_size,"");
++    try{
++#if defined(_WIN32)
++        if(!options||!params||!llama_ssd_options_b70_stream(options)||options->b70_model_prepared)throw std::runtime_error("B70 model preparation requires one fresh configured owner");
++        const auto * gpu_budget=options->settings.vram_budget();
++        if(!gpu_budget||gpu_budget->automatic||gpu_budget->bytes<(64ULL<<20)||gpu_budget->bytes>(16ULL<<30)||gpu_budget->bytes%(64ULL<<20)!=0)throw std::runtime_error("B70 requires an explicit bounded GPU expert-cache budget");
++        const auto * stop=options->settings.paths("owned.stop_file");
++        if(!stop||stop->size()!=1)throw std::runtime_error("B70 requires exactly one owned stop file");
++        const auto path=std::filesystem::u8path(stop->front());
++        const auto root=path.root_name().u8string();
++        std::error_code ec;
++        if(!path.is_absolute()||root.size()!=2||root[1]!=':'||path.parent_path().filename()!="control"||path.extension()!=".stop"||std::filesystem::exists(path,ec)||ec)throw std::runtime_error("B70 stop file must be absent and under a local owned control directory");
++        ggml_backend_dev_t selected=nullptr;
++        auto reg=ggml_backend_reg_by_name("Vulkan");
++        if(!reg)throw std::runtime_error("Vulkan backend missing; no fallback");
++        for(size_t i=0;i<ggml_backend_reg_dev_count(reg);++i){
++            auto dev=ggml_backend_reg_dev_get(reg,i);const char * desc=ggml_backend_dev_description(dev);
++            if(desc&&std::strstr(desc,"Intel")&&std::strstr(desc,"B70")&&ggml_backend_dev_type(dev)==GGML_BACKEND_DEVICE_TYPE_GPU){
++                if(selected)throw std::runtime_error("More than one B70 requires separate qualification");
++                selected=dev;
++            }
++        }
++        if(!selected)throw std::runtime_error("Actual discrete Intel B70 missing; no fallback");
++        auto cpu=ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        if(!cpu||!ggml_backend_dev_buffer_type(cpu))throw std::runtime_error("CPU metadata buffer provider missing");
++        options->b70_devices={selected,nullptr};
++        options->b70_buffers={
++            {"^blk\\.[0-9]+\\.ffn_(up|down|gate|gate_up)_(ch)?exps\\.weight$",ggml_backend_dev_buffer_type(cpu)},
++            {"^token_embd\\.weight$",ggml_backend_dev_buffer_type(selected)},
++            {nullptr,nullptr}};
++        params->devices=options->b70_devices.data();params->tensor_buft_overrides=options->b70_buffers.data();
++        params->n_gpu_layers=INT32_MAX;params->split_mode=LLAMA_SPLIT_MODE_NONE;params->main_gpu=0;params->tensor_split=nullptr;
++        params->use_mmap=true;params->use_direct_io=false;params->use_mlock=false;params->check_tensors=false;
++        params->use_extra_bufts=false;params->no_host=true;params->defer_experts=true;params->b70_buffer_stream=true;params->no_alloc=false;params->vocab_only=false;
++        const auto * local=options->settings.integer("b70.process_vram_mib");
++        const auto * headroom=options->settings.integer("b70.wddm_headroom_mib");
++        const auto * nonlocal=options->settings.integer("b70.nonlocal_vram_mib");
++        if(!local||!headroom||!nonlocal)throw std::runtime_error("Typed B70 process-memory limits are missing");
++        constexpr uint64_t mib=1ULL<<20;
++        if(gpu_budget->bytes>=*local*mib)throw std::runtime_error("B70 cache leaves no room under the process-memory limit");
++        options->b70_stop_file=path;
++        options->b70_load_memory=std::make_unique<ssd::stream::memory_guard>(*local*mib,*headroom*mib,*nonlocal*mib);
++        options->b70_load_memory->check();
++        options->b70_prior_progress=params->progress_callback;
++        options->b70_prior_progress_data=params->progress_callback_user_data;
++        params->progress_callback=b70_load_progress;params->progress_callback_user_data=options;
++        options->b70_model_prepared=true;
++        return true;
++#else
++        (void)options;(void)params;throw std::runtime_error("B70 model preparation is Windows-only");
++#endif
++    }catch(const std::exception & e){error_text(error,error_size,e.what());return false;}
++}
++
++
+ bool llama_ssd_check_environment(char * error, size_t size) {
+     error_text(error, size, "");
+     try {
+@@ -162,10 +243,27 @@
+         throw std::runtime_error("CUDA allocation reserve is not representable in bytes");
+     }
+     services.gpu_reserve_bytes = static_cast<size_t>(*reserve_mib) * mib;
++    if(llama_ssd_options_b70_stream(&options)){
++        const auto * host_mib=settings.integer("expert.host_cache_mib");
++        const auto * stop=settings.paths("owned.stop_file");
++        const auto * gpu=settings.vram_budget();
++        if(!host_mib||*host_mib>8192||!stop||stop->size()!=1||!gpu||gpu->automatic)throw std::runtime_error("B70 cache requires explicit budgets and one owned stop file");
++        const auto * local=settings.integer("b70.process_vram_mib");
++        const auto * headroom=settings.integer("b70.wddm_headroom_mib");
++        const auto * nonlocal=settings.integer("b70.nonlocal_vram_mib");
++        if(!local||!headroom||!nonlocal)throw std::runtime_error("Typed B70 process-memory limits missing at context construction");
++        if(!events)throw std::runtime_error("B70 streaming requires an exclusively owned telemetry file");
++        stream.configure_buffer_cache(*host_mib*mib,gpu->bytes,stop->front(),*local*mib,*headroom*mib,*nonlocal*mib);
++    }
+ }
+ 
+ void llama_ssd_context::attach_backend(ggml_backend_t backend) {
+     if (!sources.resolve) { return; }
++    if(stream.buffer_stream_enabled()){
++        const auto type=ggml_backend_dev_type(ggml_backend_get_device(backend));
++        if(type==GGML_BACKEND_DEVICE_TYPE_GPU||type==GGML_BACKEND_DEVICE_TYPE_IGPU||type==GGML_BACKEND_DEVICE_TYPE_META)stream.attach_buffer_backend(backend);
++        return;
++    }
+     const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+     const auto get = reinterpret_cast<ssd::gpu::get_provider_v1>(
+         ggml_backend_reg_get_proc_address(registry, "ggml_backend_ssd_provider_v1"));
+diff --git a/engine/src/ssd/options.h b/engine/src/ssd/options.h
+--- a/engine/src/ssd/options.h
++++ b/engine/src/ssd/options.h
+@@ -11,11 +11,25 @@
+ #include "ggml-ssd/stream/runtime.h"
+ 
+ #include <memory>
++#if defined(_WIN32)
++#include "ggml-ssd/stream/memory-guard.h"
++#include <filesystem>
++#endif
+ 
+ struct llama_ssd_options {
+     ssd::settings::snapshot settings;
+     ssd::telemetry::debug_channels debug;
+     std::string telemetry_file;
++    std::vector<ggml_backend_dev_t> b70_devices;
++    std::vector<llama_model_tensor_buft_override> b70_buffers;
++    bool b70_model_prepared = false;
++#if defined(_WIN32)
++    std::unique_ptr<ssd::stream::memory_guard> b70_load_memory;
++    std::filesystem::path b70_stop_file;
++    llama_progress_callback b70_prior_progress = nullptr;
++    void * b70_prior_progress_data = nullptr;
++    bool b70_load_failed = false;
++#endif
+ };
+ 
+ struct llama_model;
+diff --git a/engine/tests/CMakeLists.txt b/engine/tests/CMakeLists.txt
+--- a/engine/tests/CMakeLists.txt
++++ b/engine/tests/CMakeLists.txt
+@@ -922,3 +922,10 @@
+     # The fixed extraction reference is test-only and never a production input.
+     add_subdirectory(ssd/fixtures/c0-store ${CMAKE_CURRENT_BINARY_DIR}/ssd-store)
+ endif()
++
++# Explicit owned qualification only; no automatic test execution.
++if(WIN32 AND TARGET ggml-vulkan)
++    add_executable(test-b70-buffer-cache ssd/test-b70-buffer-cache.cpp)
++    target_include_directories(test-b70-buffer-cache PRIVATE ../ggml/src/ggml-ssd/stream ../ggml/src/ggml-ssd)
++    target_link_libraries(test-b70-buffer-cache PRIVATE ggml-ssd-stream ggml-base ggml-cpu ggml-vulkan)
++endif()
+diff --git a/engine/tests/ssd/test-b70-buffer-cache.cpp b/engine/tests/ssd/test-b70-buffer-cache.cpp
+new file mode 100644
+--- /dev/null
++++ b/engine/tests/ssd/test-b70-buffer-cache.cpp
+@@ -0,0 +1,140 @@
++// SPDX-License-Identifier: Apache-2.0
++// Bounded transport test only. This is NOT a full-model inference acceptance.
++#include "buffer-cache.h"
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++#include "ggml-vulkan.h"
++#include "platform/file.h"
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <limits>
++#include <stdexcept>
++#include <string>
++#include <vector>
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++
++namespace {
++constexpr int columns=2048,rows=1024,experts=20;
++constexpr size_t stride=size_t(columns)*rows*sizeof(float),mib=1024*1024;
++void require(bool x,const char * why){if(!x)throw std::runtime_error(why);}
++float weight(int expert,int row,int col){return float((expert*37+row*3+col*13)%31-15)/256.0f;}
++struct source {
++    int fd=-1;
++    ssd::platform::file_identity fixture;
++    const ggml_tensor * metadata=nullptr;
++    static bool validate(void * opaque,const ggml_tensor * t,int descriptor,uint64_t offset,size_t bytes,int64_t count,int expert)noexcept{
++        if(!opaque||!t||expert<0||expert>=experts||bytes!=stride||count!=experts||offset!=uint64_t(expert)*stride)return false;
++        const auto & self=*static_cast<source *>(opaque);ssd::platform::file_identity now;
++        return t==self.metadata&&descriptor==self.fd&&ssd::platform::identity(descriptor,now)&&now==self.fixture;
++    }
++    static bool resolve(void * opaque,const char * name,int expert,size_t bytes,int64_t count,
++                        int * fd,uint64_t * offset,size_t * logical)noexcept{
++        if(!opaque||!name||std::strcmp(name,"probe_experts")!=0||expert<0||expert>=experts||bytes!=stride||count!=experts)return false;
++        *fd=static_cast<source *>(opaque)->fd;*offset=uint64_t(expert)*stride;*logical=stride;return true;
++    }
++};
++struct resources {
++    ggml_context * host_ctx=nullptr,*gpu_ctx=nullptr;
++    ggml_backend_t backend=nullptr;
++    ggml_backend_buffer_t host_buf=nullptr,gpu_buf=nullptr;
++    int fd=-1;
++    ~resources(){
++        if(backend)ggml_backend_synchronize(backend);
++        if(gpu_buf)ggml_backend_buffer_free(gpu_buf);
++        if(host_buf)ggml_backend_buffer_free(host_buf);
++        if(gpu_ctx)ggml_free(gpu_ctx);
++        if(host_ctx)ggml_free(host_ctx);
++        if(fd>=0)ssd::platform::close_fd(fd);
++        if(backend)ggml_backend_free(backend);
++    }
++};
++}
++int main(int argc,char ** argv){
++    try{
++        require(argc==2,"pass the owned canary output directory");
++        const auto root=std::filesystem::weakly_canonical(std::filesystem::path(argv[1]));
++        const auto allowed=std::filesystem::weakly_canonical(std::filesystem::current_path() / "canary");
++        require(root.parent_path()==allowed,"fixture directory must be directly under owned canary root");
++        require(!std::filesystem::exists(root),"test directory already exists; no overwrite or retry");
++        std::filesystem::create_directory(root);
++        const auto path=root/"immutable-experts.f32";
++        {
++            std::ofstream file(path,std::ios::binary|std::ios::out);
++            require(bool(file),"cannot create owned fixture");
++            std::vector<float> matrix(size_t(columns)*rows);
++            for(int e=0;e<experts;++e){
++                for(int r=0;r<rows;++r)for(int c=0;c<columns;++c)matrix[size_t(r)*columns+c]=weight(e,r,c);
++                file.write(reinterpret_cast<char *>(matrix.data()),std::streamsize(stride));
++            }
++            require(bool(file),"fixture write failed");
++        }
++        resources owner;
++        owner.fd=ssd::platform::open_direct(path.u8string().c_str());require(owner.fd>=0,"fixture direct open failed");
++        ggml_backend_reg_t registry=ggml_backend_vk_reg();ggml_backend_dev_t device=nullptr;
++        for(size_t i=0;i<ggml_backend_reg_dev_count(registry);++i){
++            const auto candidate=ggml_backend_reg_dev_get(registry,i);const char * desc=ggml_backend_dev_description(candidate);
++            if(desc&&std::string(desc).find("Intel")!=std::string::npos&&std::string(desc).find("B70")!=std::string::npos){
++                require(device==nullptr,"multiple B70 devices require separate qualification");device=candidate;
++            }
++        }
++        require(device&&ggml_backend_dev_type(device)==GGML_BACKEND_DEVICE_TYPE_GPU,"B70 discrete device required");
++        owner.backend=ggml_backend_dev_init(device,nullptr);require(owner.backend&&ggml_backend_is_vk(owner.backend),"B70 backend initialization failed");
++        owner.host_ctx=ggml_init({ggml_tensor_overhead()*4,nullptr,true});
++        owner.gpu_ctx=ggml_init({ggml_tensor_overhead()*32+ggml_graph_overhead_custom(32,false),nullptr,true});
++        require(owner.host_ctx&&owner.gpu_ctx,"metadata allocation failed");
++        auto * source_meta=ggml_new_tensor_3d(owner.host_ctx,GGML_TYPE_F32,columns,rows,experts);ggml_set_name(source_meta,"probe_experts");
++        // Metadata backing only. NaNs make any accidental source memcpy fail.
++        owner.host_buf=ggml_backend_alloc_ctx_tensors_from_buft(owner.host_ctx,ggml_backend_cpu_buffer_type());
++        require(owner.host_buf!=nullptr,"metadata host buffer failed");
++        std::vector<float> sentinels(ggml_nelements(source_meta),std::numeric_limits<float>::quiet_NaN());
++        ggml_backend_tensor_set(source_meta,sentinels.data(),0,ggml_nbytes(source_meta));
++        ggml_backend_buffer_set_usage(owner.host_buf,GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        auto * weights=ggml_new_tensor_3d(owner.gpu_ctx,GGML_TYPE_F32,columns,rows,experts);
++        auto * x=ggml_new_tensor_3d(owner.gpu_ctx,GGML_TYPE_F32,columns,1,1);
++        auto * ids=ggml_new_tensor_2d(owner.gpu_ctx,GGML_TYPE_I32,1,1);
++        auto * y=ggml_mul_mat_id(owner.gpu_ctx,weights,x,ids);
++        require(ggml_backend_dev_supports_op(device,y),"B70 MUL_MAT_ID unsupported; no CPU fallback");
++        auto * graph=ggml_new_graph_custom(owner.gpu_ctx,32,false);ggml_build_forward_expand(graph,y);
++        owner.gpu_buf=ggml_backend_alloc_ctx_tensors(owner.gpu_ctx,owner.backend);require(owner.gpu_buf!=nullptr,"bounded GPU test tensors failed");
++        require(ggml_backend_buffer_get_size(owner.gpu_buf)<256*mib,"GPU test workspace unexpectedly large");
++        ggml_backend_tensor_set(weights,sentinels.data(),0,ggml_nbytes(weights));
++        std::vector<float> vector(columns),result(rows);
++        for(int c=0;c<columns;++c)vector[c]=float(c%7-3)/32.0f;
++        ggml_backend_tensor_set(x,vector.data(),0,vector.size()*sizeof(float));
++        source input;input.fd=owner.fd;input.metadata=source_meta;
++        require(ssd::platform::identity(owner.fd,input.fixture),"fixture identity failed");
++        ssd::stream::buffer_cache cache({&input,source::resolve,nullptr},128*mib,64*mib);cache.bind_source(source::validate,&input);cache.attach(owner.backend);
++        std::vector<int> order={0,1,0};for(int e=2;e<10;++e)order.push_back(e);order.push_back(0);
++        for(int e=10;e<experts;++e)order.push_back(e);order.push_back(1);
++        float max_error=0;
++        for(int e:order){
++            int32_t counts[experts]={};counts[e]=1;
++            ggml_backend_synchronize(owner.backend);
++            ggml_backend_tensor_set(weights,sentinels.data(),size_t(e)*stride,stride);
++            require(cache.copy(owner.backend,source_meta,weights,experts,stride,counts)==1,"SSD/cache/GPU copy failed");
++            const int32_t id=e;ggml_backend_tensor_set(ids,&id,0,sizeof(id));
++            require(ggml_backend_graph_compute(owner.backend,graph)==GGML_STATUS_SUCCESS,"direct B70 expert graph failed");
++            ggml_backend_synchronize(owner.backend);ggml_backend_tensor_get(y,result.data(),0,result.size()*sizeof(float));
++            for(int r=0;r<rows;++r){
++                double expected=0;for(int c=0;c<columns;++c)expected+=double(weight(e,r,c))*vector[c];
++                require(std::isfinite(result[r]),"non-finite B70 result");
++                max_error=std::max(max_error,float(std::abs(double(result[r])-expected)));
++            }
++        }
++        const auto stats=cache.stats();
++        require(max_error<1e-5f,"B70 expert arithmetic differs from scalar reference");
++        require(stats.ssd_reads>0&&stats.gpu_hits>0&&stats.host_hits>0&&stats.host_evictions>0&&stats.gpu_evictions>0,"cache hit/eviction gates not exercised");
++        require(stats.host_peak<=128*mib&&stats.gpu_peak<=64*mib&&stats.gpu_reserved_peak<=64*mib&&stats.gpu_allocation_peak<=64*mib,"cache budget exceeded");
++        require(stats.device_local_checks>0&&stats.gpu_allocation_bytes>0,"No actual B70 device-local allocation evidence");
++        require(cache.observe_memory(),"process VRAM accounting/ceiling failed");
++        std::printf("{\"format\":\"wicibridge-cache-transport-test/1\",\"passed\":true,\"model_inference\":false,\"bridge_complete\":false,\"cpu_math_fallback\":false,\"calls\":%zu,\"max_abs_error\":%.9g,\"cache\":%s}\n",order.size(),max_error,cache.stats_json().c_str());
++        return 0;
++    }catch(const std::exception & e){std::fprintf(stderr,"cache transport test failed: %.512s\n",e.what());return 1;}
++}

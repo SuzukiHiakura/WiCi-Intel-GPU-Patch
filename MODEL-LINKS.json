@@ -1,0 +1,8 @@
+{
+  "deepseek_base": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "deepseek_gguf": "https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/Q8_0",
+  "gpt_quantizer": "https://huggingface.co/mradermacher/gpt-oss-120b-Derestricted-GGUF",
+  "gpt_single_file_listing": "https://huggingface.co/gghfez/gpt-oss-120b-Derestricted.MXFP4_MOE-gguf",
+  "gpt_finetune": "https://huggingface.co/ArliAI/gpt-oss-120b-Derestricted",
+  "gpt_base": "https://huggingface.co/openai/gpt-oss-120b"
+}

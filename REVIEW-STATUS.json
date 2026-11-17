@@ -1,0 +1,10 @@
+{
+  "prepared_utc": "2026-11-17T19:52:55.260783+00:00",
+  "goal_status": "complete",
+  "functional_on_tested_intel_b70": true,
+  "recipe_benchmarks_completed": 2,
+  "local_output_cap": 512,
+  "publication_approved": false,
+  "release_scope": "backend source patches, functional proof, examples and measurements",
+  "clean_public_rebuild_performed": false
+}

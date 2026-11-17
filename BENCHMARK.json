@@ -1,0 +1,243 @@
+{
+  "format": "wicibridge-public-benchmark/1",
+  "prepared_utc": "2026-11-17T19:52:55.260783+00:00",
+  "tested_output_allowance": 512,
+  "models": [
+    {
+      "model": "GPT-OSS 120B",
+      "successful_bounded_response": true,
+      "complete_recipe_verified": false,
+      "prefill_tokens": 273,
+      "generated_tokens_including_eos": 512,
+      "output_cap": 512,
+      "ended_with_eos": false,
+      "input_cap": 1024,
+      "context": 4096,
+      "batch": 64,
+      "microbatch": 32,
+      "swa_full": true,
+      "host_cache_bytes": 536870912,
+      "gpu_cache_bytes": 2147483648,
+      "owner_elapsed_seconds": 1645.092,
+      "prefill_seconds": 326.0995001,
+      "decode_tokens_per_second": {
+        "average": 0.3906057315186355,
+        "low": 0.25259657916535927,
+        "peak": 0.8205754367307568,
+        "reason": null
+      },
+      "resources": {
+        "samples": 6524,
+        "whole_system_cpu_percent": {
+          "low": 1.04,
+          "average": 19.526440833844266,
+          "peak": 100.0,
+          "samples": 6524
+        },
+        "whole_system_ram_load_percent": {
+          "low": 33,
+          "average": 38.20095033721643,
+          "peak": 44,
+          "samples": 6524
+        },
+        "minimum_system_free_bytes": 38398746624,
+        "root_logical_read_bytes": 821253112544,
+        "root_logical_read_bytes_per_second_sampled": {
+          "low": 0.0,
+          "average": 501578301.6638304,
+          "peak": 808380685.2590404,
+          "samples": 6523
+        },
+        "io_scope": "Root-process Windows I/O counters. Logical file reads; not physical SSD/NAND reads. CPU/RAM values are whole-system samples, not per-model attribution."
+      },
+      "cache_and_gpu": {
+        "events": 56669,
+        "counters": {
+          "ssd_bytes": 821237370880,
+          "ssd_reads": 186179,
+          "h2d_bytes": 820473943936,
+          "d2d_bytes": 1133518882560,
+          "gpu_hits": 71035,
+          "gpu_misses": 186179,
+          "gpu_evictions": 185702,
+          "host_hits": 0,
+          "host_misses": 186179,
+          "host_evictions": 186058,
+          "gpu_peak": 2115317760,
+          "host_peak": 533778432,
+          "gpu_reserved_peak": 2147483648,
+          "fallbacks": 0
+        },
+        "process_local_vram_peak_bytes_sampled": 6669033472,
+        "process_nonlocal_video_memory_peak_bytes_sampled": 70266880,
+        "scope": "Expert-stream/cache counters. ssd_reads is a read-operation counter; ssd_bytes carries bytes. H2D/D2D totals do not establish instantaneous PCIe bandwidth."
+      },
+      "expert_transfer_bytes_per_second_end_to_end": {
+        "ssd_bytes": 499204525.266672,
+        "h2d_bytes": 498740461.8927087,
+        "d2d_bytes": 689030694.0645264
+      },
+      "cooking_accuracy_validated": false,
+      "weight_storage_bytes": 63387347008,
+      "tested_file": "gpt-oss-120b-Derestricted.MXFP4_MOE.gguf",
+      "model_links": {
+        "gpt_quantizer": "https://huggingface.co/mradermacher/gpt-oss-120b-Derestricted-GGUF",
+        "gpt_single_file_listing": "https://huggingface.co/gghfez/gpt-oss-120b-Derestricted.MXFP4_MOE-gguf",
+        "gpt_finetune": "https://huggingface.co/ArliAI/gpt-oss-120b-Derestricted",
+        "gpt_base": "https://huggingface.co/openai/gpt-oss-120b"
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash 1017 (mixed quantization)",
+      "successful_bounded_response": true,
+      "complete_recipe_verified": false,
+      "prefill_tokens": 211,
+      "generated_tokens_including_eos": 512,
+      "output_cap": 512,
+      "ended_with_eos": false,
+      "input_cap": 1024,
+      "context": 4096,
+      "batch": 64,
+      "microbatch": 1,
+      "swa_full": false,
+      "host_cache_bytes": 8388608,
+      "gpu_cache_bytes": 67108864,
+      "owner_elapsed_seconds": 4151.199,
+      "prefill_seconds": 1231.5563256,
+      "decode_tokens_per_second": {
+        "average": 0.17608665761737208,
+        "low": 0.1530601358886272,
+        "peak": 0.18673886289888333,
+        "reason": null
+      },
+      "resources": {
+        "samples": 16499,
+        "whole_system_cpu_percent": {
+          "low": 3.61,
+          "average": 23.959036305230622,
+          "peak": 100.0,
+          "samples": 16499
+        },
+        "whole_system_ram_load_percent": {
+          "low": 36,
+          "average": 51.90078186556761,
+          "peak": 57,
+          "samples": 16499
+        },
+        "minimum_system_free_bytes": 29476012032,
+        "root_logical_read_bytes": 3259935736156,
+        "root_logical_read_bytes_per_second_sampled": {
+          "low": 0.0,
+          "average": 787244830.8202127,
+          "peak": 1003356160.0,
+          "samples": 16498
+        },
+        "io_scope": "Root-process Windows I/O counters. Logical file reads; not physical SSD/NAND reads. CPU/RAM values are whole-system samples, not per-model attribution."
+      },
+      "cache_and_gpu": {
+        "events": 87363,
+        "counters": {
+          "ssd_bytes": 3259904128256,
+          "ssd_reads": 519840,
+          "h2d_bytes": 3258040648704,
+          "d2d_bytes": 3258040648704,
+          "gpu_hits": 0,
+          "gpu_misses": 519840,
+          "gpu_evictions": 519830,
+          "host_hits": 0,
+          "host_misses": 519840,
+          "host_evictions": 519839,
+          "gpu_peak": 62673920,
+          "host_peak": 6270976,
+          "gpu_reserved_peak": 67108864,
+          "fallbacks": 0
+        },
+        "process_local_vram_peak_bytes_sampled": 11546361856,
+        "process_nonlocal_video_memory_peak_bytes_sampled": 68329472,
+        "scope": "Expert-stream/cache counters. ssd_reads is a read-operation counter; ssd_bytes carries bytes. H2D/D2D totals do not establish instantaneous PCIe bandwidth."
+      },
+      "expert_transfer_bytes_per_second_end_to_end": {
+        "ssd_bytes": 785292183.8379707,
+        "h2d_bytes": 784843282.3153023,
+        "d2d_bytes": 784843282.3153023
+      },
+      "cooking_accuracy_validated": false,
+      "weight_storage_bytes": 507954227008,
+      "tested_file_pattern": "DeepSeek-V4.1-Flash-1017-Q8_0-00001-of-00010.gguf through00010",
+      "model_links": {
+        "deepseek_base": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "deepseek_gguf": "https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/Q8_0"
+      }
+    }
+  ],
+  "hardware": {
+    "captured_utc": "2026-11-17T17:56:35.0149564Z",
+    "windows": {
+      "Caption": "Microsoft Windows 10 Education",
+      "Version": "10.0.19045",
+      "BuildNumber": "19045",
+      "OSArchitecture": "64-bit"
+    },
+    "cpu": {
+      "Name": "Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz",
+      "NumberOfCores": 6,
+      "NumberOfLogicalProcessors": 12
+    },
+    "motherboard": {
+      "Manufacturer": "Micro-Star International Co., Ltd.",
+      "Product": "Z390-A PRO (MS-7B98)"
+    },
+    "memory": [
+      {
+        "Capacity": 34359738368,
+        "ConfiguredClockSpeed": 3200
+      },
+      {
+        "Capacity": 34359738368,
+        "ConfiguredClockSpeed": 3200
+      }
+    ],
+    "gpus": [
+      {
+        "Name": "Intel(R) UHD Graphics 630",
+        "DriverVersion": "24.20.100.6345",
+        "DriverDate": "2018-09-13T19:00:00-05:00"
+      },
+      {
+        "Name": "Intel(R) Arc(TM) Pro B70 Graphics",
+        "DriverVersion": "32.0.101.8976",
+        "DriverDate": "2026-08-27T19:00:00-05:00"
+      }
+    ],
+    "storage": [
+      {
+        "Model": "CT1000BX500SSD1",
+        "Size": 1000202273280,
+        "InterfaceType": "IDE"
+      },
+      {
+        "Model": "TEAM TM8PS7512G",
+        "Size": 512105932800,
+        "InterfaceType": "IDE"
+      },
+      {
+        "Model": "T-FORCE TM8FGQ004T",
+        "Size": 4096798110720,
+        "InterfaceType": "SCSI"
+      },
+      {
+        "Model": "WD Blue SN570 1TB",
+        "Size": 1000202273280,
+        "InterfaceType": "SCSI"
+      }
+    ],
+    "windows_build": {
+      "ProductName": "Windows 10 Education",
+      "EditionID": "Education",
+      "DisplayVersion": "22H2",
+      "CurrentBuildNumber": "19045",
+      "UBR": 6456
+    }
+  },
+  "scope": "Functional proof using WiCi/InferSSD on Intel Arc Pro B70; original512-token local runs. Model-specific configurations differ. The source patches are public derivatives of those working builds."
+}

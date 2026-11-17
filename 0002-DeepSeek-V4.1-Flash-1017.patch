@@ -1,0 +1,800 @@
+diff --git a/engine/ggml/src/ggml-vulkan/vulkan-shaders/softplus-f32.comp b/engine/ggml/src/ggml-vulkan/vulkan-shaders/softplus-f32.comp
+new file mode 100644
+--- /dev/null
++++ b/engine/ggml/src/ggml-vulkan/vulkan-shaders/softplus-f32.comp
+@@ -0,0 +1,32 @@
++#version 450
++
++#include "generic_head.glsl"
++#include "types.glsl"
++
++#extension GL_EXT_control_flow_attributes : enable
++
++layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
++layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
++
++void main() {
++    const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
++
++    if (i >= p.KX) {
++        return;
++    }
++
++    const float x = float(data_a[i]);
++    float result;
++    if (x > 20.0f) {
++        result = x;
++    } else {
++        // Compensate rounding of 1+exp(x); preserve the negative tail.
++        precise float z = exp(x);
++        precise float u = 1.0f + z;
++        precise float increment = u - 1.0f;
++        result = (u == 1.0f) ? z : log(u) * (z / increment);
++    }
++    data_d[i] = D_TYPE(result);
++}
+diff --git a/engine/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/engine/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+--- a/engine/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/engine/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -896,7 +896,7 @@
+     string_to_spv("diag_f32",       "diag.comp",        {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
+ 
+     string_to_spv("softplus_f16",   "softplus.comp",    {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
+-    string_to_spv("softplus_f32",   "softplus.comp",    {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
++    string_to_spv("softplus_f32",   "softplus-f32.comp",    {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
+ 
+     string_to_spv("add1_f16_f16",   "add1.comp",        {{"A_TYPE", "float16_t"},   {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
+     string_to_spv("add1_f16_f32",   "add1.comp",        {{"A_TYPE", "float16_t"},   {"B_TYPE", "float"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
+diff --git a/engine/src/b70-deepseek-ops.h b/engine/src/b70-deepseek-ops.h
+new file mode 100644
+--- /dev/null
++++ b/engine/src/b70-deepseek-ops.h
+@@ -0,0 +1,35 @@
++#pragma once
++#include "ggml.h"
++#include <cmath>
++#include <stdexcept>
++
++// DeepSeek reference clamps the raw gate BEFORE SiLU. All operations below
++// execute on the admitted B70; this header contains graph construction only.
++inline ggml_tensor * b70_deepseek_swiglu_clamp(ggml_context * ctx,ggml_tensor * gate,ggml_tensor * up,float limit) {
++    if(!gate||!up||gate->type!=GGML_TYPE_F32||up->type!=GGML_TYPE_F32||
++       !ggml_are_same_shape(gate,up)||!ggml_is_contiguous(gate)||!ggml_is_contiguous(up)||
++       !std::isfinite(limit)||limit<=1e-6f||ggml_nelements(gate)<=0||ggml_nelements(gate)>2304LL*6*32)
++        throw std::runtime_error("Unadmitted B70 DeepSeek clipped activation geometry");
++    auto * clipped_gate=ggml_clamp(ctx,gate,-INFINITY,limit);
++    auto * clipped_up=ggml_clamp(ctx,up,-limit,limit);
++    return ggml_mul(ctx,ggml_silu(ctx,clipped_gate),clipped_up);
++}
++
++inline ggml_tensor * b70_deepseek_row_mask(ggml_context * ctx,ggml_tensor * counts,int64_t width,int64_t streams) {
++    if(!counts||counts->type!=GGML_TYPE_I32||!ggml_is_vector(counts)||!ggml_is_contiguous(counts)||
++       width<=0||width>4096||streams<=0||streams>32||counts->ne[0]<=0||counts->ne[0]>32||counts->ne[0]%streams)
++        throw std::runtime_error("Unadmitted B70 DeepSeek row mask geometry");
++    const int64_t rows=counts->ne[0];
++    auto * columns=ggml_repeat_4d(ctx,ggml_arange(ctx,0.f,float(width),1.f),width,rows,1,1);
++    auto * visible=ggml_reshape_2d(ctx,ggml_cast(ctx,counts,GGML_TYPE_F32),1,rows);
++    // The retained Vulkan STEP shader uses x >= 0: equality is MASKED.
++    // Every column and relevant boundary count is exactly representable in F32.
++    auto * blocked=ggml_step(ctx,ggml_sub(ctx,columns,visible));
++    auto * ids=ggml_reshape_1d(ctx,ggml_cast(ctx,blocked,GGML_TYPE_I32),width*rows);
++    auto * zero=ggml_fill(ctx,ggml_new_tensor_2d(ctx,GGML_TYPE_F32,1,1),0.f);
++    auto * negative_infinity=ggml_fill(ctx,ggml_new_tensor_2d(ctx,GGML_TYPE_F32,1,1),-INFINITY);
++    auto * table=ggml_concat(ctx,zero,negative_infinity,1);
++    // Exact lookup preserves +0/-infinity without log(0), division by zero,
++    // or multiplication of zero by infinity.
++    return ggml_reshape_4d(ctx,ggml_get_rows(ctx,table,ids),width,rows/streams,1,streams);
++}
+diff --git a/engine/src/b70-deepseek-tail-rope.h b/engine/src/b70-deepseek-tail-rope.h
+new file mode 100644
+--- /dev/null
++++ b/engine/src/b70-deepseek-tail-rope.h
+@@ -0,0 +1,34 @@
++#pragma once
++#include "ggml.h"
++#include <cstdint>
++#include <cstring>
++#include <stdexcept>
++
++// Graph construction only. Copies, rotation and concatenation execute on B70.
++// The retained Vulkan shader has no n_offs push constant, so rotate a compact
++// tail with offset zero, preserving every other RoPE parameter byte for byte.
++inline ggml_tensor * b70_deepseek_set_rope_offset(
++        ggml_context * ctx, ggml_tensor * rope, int offset, bool enabled) {
++    if (!enabled || offset == 0) return ggml_rope_set_offset(rope, offset);
++    if (!rope || (rope->op != GGML_OP_ROPE && rope->op != GGML_OP_ROPE_BACK) ||
++            !rope->src[0] || !rope->src[1] || rope->src[3] || offset < 0)
++        throw std::runtime_error("Unadmitted B70 tail RoPE operation");
++    const int32_t dims=rope->op_params[1],mode=rope->op_params[2];
++    auto * input=rope->src[0];
++    if (input->type!=GGML_TYPE_F32 || input->nb[0]!=sizeof(float) ||
++            mode!=GGML_ROPE_TYPE_NORMAL || dims!=64 ||
++            (input->ne[0]!=128 && input->ne[0]!=512) || input->ne[0]!=offset+dims ||
++            input->ne[1]<1 || input->ne[1]>128 || input->ne[2]<1 || input->ne[2]>32 || input->ne[3]!=1 ||
++            ggml_nbytes(input)>(8ULL<<20))
++        throw std::runtime_error("Unadmitted B70 tail RoPE geometry");
++    auto * prefix=ggml_cont(ctx,ggml_view_3d(ctx,input,offset,input->ne[1],input->ne[2],
++            input->nb[1],input->nb[2],0));
++    auto * tail=ggml_cont(ctx,ggml_view_3d(ctx,input,dims,input->ne[1],input->ne[2],
++            input->nb[1],input->nb[2],size_t(offset)*input->nb[0]));
++    auto * rotated=rope->op==GGML_OP_ROPE
++        ? ggml_rope_ext(ctx,tail,rope->src[1],rope->src[2],dims,mode,0,10000.f,1.f,0.f,1.f,0.f,0.f)
++        : ggml_rope_ext_back(ctx,tail,rope->src[1],rope->src[2],dims,mode,0,10000.f,1.f,0.f,1.f,0.f,0.f);
++    std::memcpy(rotated->op_params,rope->op_params,sizeof(rotated->op_params));
++    ggml_rope_set_offset(rotated,0);
++    return ggml_concat(ctx,prefix,rotated,0);
++}
+diff --git a/engine/src/b70-sparse-rows.h b/engine/src/b70-sparse-rows.h
+new file mode 100644
+--- /dev/null
++++ b/engine/src/b70-sparse-rows.h
+@@ -0,0 +1,91 @@
++// Private B70 sparse-source transport. This copies encoded bytes only; GET_ROWS
++// and every dequantization/projection remain on the selected GPU.
++#pragma once
++#include "ggml.h"
++#include "ggml-ssd/platform/file.h"
++#include <cstdint>
++#include <climits>
++#include <limits>
++#include <mutex>
++#include <stdexcept>
++#include <vector>
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <io.h>
++#endif
++
++struct llama_b70_sparse_rows {
++    struct fd_owner {
++        int value = -1;
++        ~fd_owner() { if (value >= 0) { ssd::platform::close_fd(value); } }
++        fd_owner() = default;
++        fd_owner(const fd_owner &) = delete;
++    } fd;
++    const ggml_tensor * tensor;
++    const ssd::platform::file_identity version;
++    const uint64_t offset;
++    const size_t stride, bytes;
++    mutable std::mutex mutex;
++
++    llama_b70_sparse_rows(const ggml_tensor * source, int source_fd,
++                         const ssd::platform::file_identity & identity,
++                         uint64_t file_offset) :
++        tensor(source), version(identity), offset(file_offset),
++        stride(source ? source->nb[1] : 0), bytes(source ? ggml_nbytes(source) : 0) {
++        if (source_fd < 0 || !source || source->ne[0] <= 0 || source->ne[1] <= 0 || source->ne[1] > INT32_MAX ||
++                source->ne[2] != 1 || source->ne[3] != 1 || !ggml_is_contiguous(source) ||
++                (source->type != GGML_TYPE_Q8_0 && source->type != GGML_TYPE_BF16) ||
++                !stride || stride > (1u << 20) || uint64_t(source->ne[1]) > UINT64_MAX/stride ||
++                uint64_t(source->ne[1])*stride != bytes || offset > version.size || bytes > version.size-offset) {
++            throw std::runtime_error("B70 sparse source has unadmitted geometry/type/range");
++        }
++#if defined(_WIN32)
++        fd.value = _dup(source_fd);
++        if (fd.value >= 0 && !SetHandleInformation(
++                static_cast<HANDLE>(ssd::platform::native_handle(fd.value)), HANDLE_FLAG_INHERIT, 0)) {
++            throw std::runtime_error("Cannot make sparse source handle non-inheritable");
++        }
++#else
++        (void) source_fd;
++        throw std::runtime_error("B70 sparse transport requires Windows");
++#endif
++        ssd::platform::file_identity now;
++        if (fd.value < 0 || !ssd::platform::identity(fd.value, now) || now != version) {
++            throw std::runtime_error("B70 sparse source retained-handle identity differs");
++        }
++    }
++    llama_b70_sparse_rows(const llama_b70_sparse_rows &) = delete;
++
++    void read(const int32_t * indices, size_t count, std::vector<unsigned char> & output) const {
++        std::lock_guard<std::mutex> lock(mutex);
++        if (!indices || count == 0 || count > 2048 || count > (1u << 20)/stride) {
++            throw std::runtime_error("B70 sparse request exceeds its one-MiB transport bound");
++        }
++        ssd::platform::file_identity now;
++        if (!ssd::platform::identity(fd.value, now) || now != version) {
++            throw std::runtime_error("B70 sparse source changed before row gather");
++        }
++        output.resize(count*stride);
++        for (size_t i = 0; i < count; ++i) {
++            const int32_t row = indices[i];
++            if (row < 0 || int64_t(row) >= tensor->ne[1] || uint64_t(row) > UINT64_MAX/stride ||
++                    uint64_t(row)*stride > bytes-stride) {
++                throw std::runtime_error("B70 sparse row index is outside the native table");
++            }
++            const uint64_t at = offset + uint64_t(row)*stride;
++            if (at < offset || at > version.size || stride > version.size-at ||
++                    !ssd::platform::pread_exact(fd.value, output.data()+i*stride, stride, at)) {
++                throw std::runtime_error("B70 sparse row read failed; no retry/fallback");
++            }
++        }
++        if (!ssd::platform::identity(fd.value, now) || now != version) {
++            throw std::runtime_error("B70 sparse source changed during row gather");
++        }
++    }
++};
+diff --git a/engine/src/llama-graph.cpp b/engine/src/llama-graph.cpp
+--- a/engine/src/llama-graph.cpp
++++ b/engine/src/llama-graph.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-graph.h"
++#include "b70-deepseek-ops.h"
+ 
+ #include "llama-impl.h"
+ #include "llama-kimi-compat.h"
+@@ -734,7 +735,8 @@
+         const llama_kv_cache_dsv4_context::comp_plan & plan,
+         const char * name,
+         const llama_cparams & cparams,
+-        int64_t n_stream) {
++        int64_t n_stream,
++        bool b70_lowering) {
+     inp.state_pos = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_pos.size(), std::string("dsv4_") + name + "_state_pos");
+     inp.state_persist_src_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_persist_src_idxs.size(), std::string("dsv4_") + name + "_state_persist_src_idxs");
+     inp.state_persist_dst_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_persist_dst_idxs.size(), std::string("dsv4_") + name + "_state_persist_dst_idxs");
+@@ -757,8 +759,13 @@
+ 
+         inp.kq_visible = dsv4_build_input_1d(ctx, GGML_TYPE_I32, n_tokens,
+                 std::string("dsv4_") + name + "_kq_visible");
+-        inp.kq_mask = ggml_row_mask(ctx, inp.kq_visible,
+-                use_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_stream);
++        if (b70_lowering) {
++            if (use_f16) throw std::runtime_error("B70 DeepSeek row mask requires the admitted F32 attention path");
++            inp.kq_mask = b70_deepseek_row_mask(ctx, inp.kq_visible, plan.n_kv, n_stream);
++        } else {
++            inp.kq_mask = ggml_row_mask(ctx, inp.kq_visible,
++                    use_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_stream);
++        }
+         ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
+     }
+ }
+@@ -1282,11 +1289,36 @@
+     return cvec->apply_to(ctx0, cur, il);
+ }
+ 
++ggml_tensor * llm_graph_context::build_b70_matmul(ggml_tensor * weight, ggml_tensor * input) const {
++    ggml_tensor * effective = weight;
++    const ggml_tensor * backing = weight;
++    for (unsigned depth = 0; backing->view_src; ++depth) {
++        if (depth == 16) { throw std::runtime_error("B70 weight view chain exceeds its bound"); }
++        backing = backing->view_src;
++    }
++    const auto device = backing->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(backing->buffer)) : nullptr;
++    const char * description = device ? ggml_backend_dev_description(device) : nullptr;
++    if (arch == LLM_ARCH_DEEPSEEK41 && description && std::strstr(description, "Intel") && std::strstr(description, "B70") &&
++            weight->type == GGML_TYPE_BF16 && input->type == GGML_TYPE_F32 && input->ne[1] > 1) {
++        // Exact BF16->F32 conversion on the GPU, preserving all F32 activations.
++        const int64_t rows = ggml_nrows(weight);
++        if (!ggml_is_contiguous(weight) || rows <= 0 || rows > (1 << 20) ||
++                ggml_nelements(weight) <= 0 || uint64_t(ggml_nelements(weight)) > ((16u << 20)/sizeof(float))) {
++            throw std::runtime_error("B70 BF16 matrix conversion exceeds its16MiB scratch bound");
++        }
++        auto * flat = ggml_reshape_2d(ctx0, weight, weight->ne[0], rows);
++        auto * ids = ggml_cast(ctx0, ggml_arange(ctx0, 0.0f, float(rows), 1.0f), GGML_TYPE_I32);
++        auto * f32 = ggml_get_rows(ctx0, flat, ids);
++        effective = ggml_reshape_4d(ctx0, f32, weight->ne[0], weight->ne[1], weight->ne[2], weight->ne[3]);
++    }
++    return ggml_mul_mat(ctx0, effective, input);
++}
++
+ ggml_tensor * llm_graph_context::build_lora_mm(
+           ggml_tensor * w,
+           ggml_tensor * cur,
+           ggml_tensor * w_s) const {
+-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
++    ggml_tensor * res = build_b70_matmul(w, cur);
+ 
+     for (const auto & lora : *loras) {
+         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
+@@ -1520,7 +1552,7 @@
+                     constexpr float eps = 1e-6f;
+                     if (limit > eps) {
+                         if (arch == LLM_ARCH_DEEPSEEK41) {
+-                            cur = ggml_swiglu_clamp(ctx0, cur, tmp, limit);
++                            cur = b70_deepseek_swiglu_clamp(ctx0, cur, tmp, limit);
+                         } else {
+                             ggml_tensor * gate_act = ggml_silu(ctx0, cur);
+                             cb(gate_act, "ffn_silu", il);
+@@ -1876,8 +1908,13 @@
+         ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
+         cb(weights_sum, "ffn_moe_weights_sum", il);
+ 
+-        // Avoid division by zero, clamp to smallest number representable by F16
+-        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
++        if (arch == LLM_ARCH_DEEPSEEK41) {
++            // Reference Gate.forward normalizes by sum + 1e-20, even below F16 minimum.
++            weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, 1e-20f);
++        } else {
++            // Preserve the existing normalization for every other architecture.
++            weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
++        }
+         cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
+ 
+         weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
+@@ -2218,7 +2255,7 @@
+                     constexpr float eps = 1e-6f;
+                     if (limit > eps) {
+                         if (arch == LLM_ARCH_DEEPSEEK41) {
+-                            cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
++                            cur = b70_deepseek_swiglu_clamp(ctx0, cur, up, limit);
+                         } else {
+                             ggml_tensor * gate_act = ggml_silu(ctx0, cur);
+                             cb(gate_act, "ffn_moe_silu", il);
+@@ -2358,7 +2395,59 @@
+     return moe_out;
+ }
+ 
++// Private sparse token-table input: raw bytes are transported on the host;
++// BF16 decoding and all embedding arithmetic run in GPU GET_ROWS.
++class llm_graph_input_b70_sparse_embd final : public llm_graph_input_i {
++public:
++    const llama_model & model;
++    const ggml_tensor * source;
++    ggml_tensor * packed = nullptr;
++    ggml_tensor * rows = nullptr;
++    ggml_tensor * original_tokens = nullptr;
++    std::vector<unsigned char> encoded;
++    std::vector<int32_t> compact;
++    llm_graph_input_b70_sparse_embd(const llama_model & m, const ggml_tensor * t) : model(m), source(t) {}
++    void set_input(const llama_ubatch * batch) override {
++        if (!batch->token || batch->n_tokens != rows->ne[0] || packed->ne[1] != batch->n_tokens) {
++            throw std::runtime_error("B70 sparse token batch shape changed");
++        }
++        model.read_b70_sparse_rows(source, batch->token, batch->n_tokens, encoded);
++        if (encoded.size() != ggml_nbytes(packed)) { throw std::runtime_error("B70 sparse token bytes differ"); }
++        compact.resize(batch->n_tokens);
++        for (size_t i = 0; i < compact.size(); ++i) { compact[i] = int32_t(i); }
++        ggml_backend_tensor_set(packed, encoded.data(), 0, encoded.size());
++        ggml_backend_tensor_set(rows, compact.data(), 0, compact.size()*sizeof(int32_t));
++        ggml_backend_tensor_set(original_tokens, batch->token, 0, compact.size()*sizeof(int32_t));
++    }
++    bool can_reuse(const llm_graph_params & p) override {
++        return p.ubatch.token && p.ubatch.n_tokens == rows->ne[0] && packed->ne[1] == p.ubatch.n_tokens;
++    }
++};
++
+ // input embeddings with optional lora
++ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, const llama_model & sparse_model) const {
++    if (arch == LLM_ARCH_DEEPSEEK41 && sparse_model.b70_buffer_stream_enabled() && ubatch.token) {
++        if (!sparse_model.has_b70_sparse_source(tok_embd) || !loras->empty() ||
++                hparams.n_embd_inp() != hparams.n_embd || tok_embd->type != GGML_TYPE_BF16 ||
++                ubatch.n_tokens == 0 || ubatch.n_tokens > 32) {
++            throw std::runtime_error("Unadmitted B70 sparse token-embedding configuration");
++        }
++        auto inp = std::make_unique<llm_graph_input_b70_sparse_embd>(sparse_model, tok_embd);
++        inp->packed = ggml_new_tensor_2d(ctx0, GGML_TYPE_BF16, tok_embd->ne[0], n_tokens);
++        inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++        inp->original_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++        ggml_set_input(inp->packed); ggml_set_input(inp->rows); ggml_set_input(inp->original_tokens);
++        res->t_inp_tokens = inp->original_tokens;
++        ggml_build_forward_expand(gf, inp->original_tokens);
++        auto * cur = ggml_get_rows(ctx0, inp->packed, inp->rows);
++        res->t_inp_embd = cur;
++        if (hparams.f_embedding_scale != 0.0f) { cur = ggml_scale(ctx0, cur, hparams.f_embedding_scale); }
++        cb(cur, "embd", -1);res->add_input(std::move(inp));ggml_build_forward_expand(gf, cur);
++        return cur;
++    }
++    return build_inp_embd(tok_embd);
++}
++
+ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
+     const int64_t n_embd_inp = hparams.n_embd_inp();
+     const int64_t n_embd     = hparams.n_embd;
+@@ -3188,7 +3277,7 @@
+     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
+ }
+ 
+-llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
++llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4(bool b70_lowering) const {
+     const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
+     const auto * raw_ctx  = mctx_cur->get_raw();
+ 
+@@ -3206,9 +3295,9 @@
+     inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
+     auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);
+ 
+-    dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", cparams, n_stream);
+-    dsv4_build_comp_inputs(ctx0, inp->inp_hca, mctx_cur->get_hca_plan(ubatch), "hca", cparams, n_stream);
+-    dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(ubatch), "lid", cparams, n_stream);
++    dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", cparams, n_stream, b70_lowering);
++    dsv4_build_comp_inputs(ctx0, inp->inp_hca, mctx_cur->get_hca_plan(ubatch), "hca", cparams, n_stream, b70_lowering);
++    dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(ubatch), "lid", cparams, n_stream, b70_lowering);
+     inp->inp_csa.k_rot = mctx_cur->get_csa()->build_input_k_rot(ctx0);
+     inp->inp_hca.k_rot = mctx_cur->get_hca()->build_input_k_rot(ctx0);
+     inp->inp_lid.k_rot = mctx_cur->get_lid()->build_input_k_rot(ctx0);
+diff --git a/engine/src/llama-graph.h b/engine/src/llama-graph.h
+--- a/engine/src/llama-graph.h
++++ b/engine/src/llama-graph.h
+@@ -895,6 +895,8 @@
+                      int   il) const;
+ 
+     // do mat_mul, while optionally apply lora and per-tensor scale
++    ggml_tensor * build_b70_matmul(ggml_tensor * weight, ggml_tensor * input) const;
++
+     ggml_tensor * build_lora_mm(
+               ggml_tensor * w,
+               ggml_tensor * cur,
+@@ -1014,6 +1016,7 @@
+     //
+ 
+     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
++    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, const llama_model & sparse_model) const;
+     ggml_tensor * build_inp_pos() const;
+     ggml_tensor * build_inp_attn_scale() const;
+     ggml_tensor * build_inp_out_ids() const;
+@@ -1105,7 +1108,7 @@
+     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
+ 
+     // DeepSeek-V4.1 memory (llama_kv_cache_dsv4): raw SWA inputs plus CSA / HCA / indexer compressed-cache inputs
+-    llm_graph_input_dsv4 * build_inp_dsv4() const;
++    llm_graph_input_dsv4 * build_inp_dsv4(bool b70_lowering = false) const;
+ 
+     // note: if k_cur or v_cur are not provided, they will not be stored in the memory
+     ggml_tensor * build_attn(
+diff --git a/engine/src/llama-model-loader.cpp b/engine/src/llama-model-loader.cpp
+--- a/engine/src/llama-model-loader.cpp
++++ b/engine/src/llama-model-loader.cpp
+@@ -1245,8 +1245,21 @@
+             }
+         }
+ 
++        // These four scales are widened by the existing DeepSeek graph's
++        // GET_ROWS before F32 MUL. Probe their actual first operation for storage;
++        // preserve their semantic weight_op=MUL and every later graph guard.
++        ggml_op storage_probe_op = op;
++        if (b70_defer_weight_only && get_arch() == LLM_ARCH_DEEPSEEK41 &&
++                (tn_tensor == LLM_TENSOR_ENGRAM_K || tn_tensor == LLM_TENSOR_ENGRAM_Q) &&
++                t_meta->type == GGML_TYPE_BF16 && ggml_is_contiguous(t_meta) &&
++                t_meta->ne[0] == hparams.n_embd && t_meta->ne[1] == hparams.dsv4_hc_mult &&
++                hparams.dsv4_hc_mult == 4 && t_meta->ne[2] == 1 && t_meta->ne[3] == 1 &&
++                uint64_t(ggml_nelements(t_meta)) <= ((16u << 20)/sizeof(float))) {
++            storage_probe_op = GGML_OP_GET_ROWS;
++            LLAMA_LOG_DEBUG("B70 Engram scale storage probes existing GET_ROWS conversion: %s\n", tn.str().c_str());
++        }
+         if (!buft) {
+-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
++            buft = select_weight_buft(hparams, t_meta, storage_probe_op, buft_list);
+             if (!buft) {
+                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
+             }
+@@ -1646,8 +1659,21 @@
+                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+             } else {
+-                ggml_backend_tensor_set(cur, data, 0, n_size);
+                 ggml_backend_buffer_t target_buffer = cur->view_src ? cur->view_src->buffer : cur->buffer;
++                if (b70_defer_weight_only && target_buffer && !ggml_backend_buffer_is_host(target_buffer)) {
++                    // Bound Vulkan's persistent host-visible upload staging without changing any weight bytes.
++                    constexpr size_t upload_chunk = size_t(64) << 20;
++                    for (size_t at = 0; at < n_size;) {
++                        if (progress_callback && !progress_callback(float(size_done + at)/float(size_data), progress_callback_user_data)) {
++                            return false;
++                        }
++                        const size_t count = std::min(upload_chunk, n_size - at);
++                        ggml_backend_tensor_set(cur, data + at, at, count);
++                        at += count;
++                    }
++                } else {
++                    ggml_backend_tensor_set(cur, data, 0, n_size);
++                }
+                 uint32_t expert_layer = 0;
+                 if (!drop_mmap_tensor_after_upload && drop_gpu_dense_sources && target_buffer &&
+                         !ggml_backend_buffer_is_host(target_buffer) &&
+diff --git a/engine/src/llama-model.cpp b/engine/src/llama-model.cpp
+--- a/engine/src/llama-model.cpp
++++ b/engine/src/llama-model.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-model.h"
++#include "b70-sparse-rows.h"
+ #include "ssd/model-adapter.h"
+ #include "ssd/model-pages.h"
+ #include "ssd/model-source.h"
+@@ -685,6 +686,7 @@
+     };
+     std::vector<ssd::platform::file_identity> b70_files;
+     std::map<std::string,b70_expert_record> b70_experts;
++    std::map<const ggml_tensor *,std::unique_ptr<llama_b70_sparse_rows>> b70_sparse;
+ 
+     // objects representing data potentially being locked in memory
+     llama_mlocks mlock_bufs;
+@@ -3600,8 +3602,23 @@
+     // DeepSeek-V4.1 engram tables are about 100 GB each and a token reads only a few rows. Pin them
+     // to the plain CPU buffer type so they stay mmap-backed and never land in VRAM, pinned host
+     // memory or a repacked buffer. Listed first so it wins over any other override.
++    auto b70_sparse_metadata = [&](const ggml_tensor * t) -> bool {
++        if (!params.b70_buffer_stream || arch != LLM_ARCH_DEEPSEEK41 || !t ||
++                t->ne[2] != 1 || t->ne[3] != 1 || !ggml_is_contiguous(t)) { return false; }
++        if (t == tok_embd) {
++            return t->type == GGML_TYPE_BF16 && t->ne[0] == hparams.n_embd && t->ne[1] == vocab.n_tokens();
++        }
++        for (const auto & layer : layers) {
++            if (layer.engram_embd == t) {
++                return !hparams.engram_e4m3_e8m0_32_row264 && t->type == GGML_TYPE_Q8_0 &&
++                    t->ne[0] == 256 && t->ne[1] > 0 && t->ne[1] <= INT32_MAX;
++            }
++        }
++        return false;
++    };
+     std::vector<llama_model_tensor_buft_override> engram_buft_overrides;
+     if (arch == LLM_ARCH_DEEPSEEK41) {
++        if (params.b70_buffer_stream) { engram_buft_overrides.push_back({ "token_embd\\.weight", ggml_backend_cpu_buffer_type() }); }
+         engram_buft_overrides.push_back({ "blk\\.[0-9]+\\.engram_embd\\.weight", ggml_backend_cpu_buffer_type() });
+         if (ml.tensor_buft_overrides) {
+             for (const llama_model_tensor_buft_override * override = ml.tensor_buft_overrides; override->pattern != nullptr; ++override) {
+@@ -8790,10 +8807,12 @@
+             auto buft=item.first;
+             for (auto * t=ggml_get_first_tensor(item.second.get());t;t=ggml_get_next_tensor(item.second.get(),t)) {
+                 uint32_t layer=0;
+-                const bool deferred=ml.is_deferred_expert_name(t->name,layer);
++                const bool deferred=ml.is_deferred_expert_name(t->name,layer) || b70_sparse_metadata(t);
+                 if ((deferred && buft!=ggml_backend_cpu_buffer_type()) ||
+                     (!deferred && (ggml_backend_buft_get_device(buft)!=params.devices[0] || ggml_backend_buft_is_host(buft)))) {
+-                    throw std::runtime_error("B70 model storage selected an unadmitted buffer; no fallback");
++                    throw std::runtime_error(std::string("B70 model storage selected an unadmitted buffer; tensor=") +
++                        t->name + " type=" + ggml_type_name(t->type) + " buffer=" + ggml_backend_buft_name(buft) +
++                        " deferred=" + (deferred ? "true" : "false") + "; no fallback");
+                 }
+             }
+         }
+@@ -9033,6 +9052,31 @@
+             if (!pimpl->b70_experts.emplace(named.first,record).second) { throw std::runtime_error("Duplicate native expert catalog entry"); }
+         }
+         if (pimpl->b70_experts.empty()) { throw std::runtime_error("Native B70 expert catalog is empty"); }
++        if (arch == LLM_ARCH_DEEPSEEK41) {
++            size_t expected = 1;
++            for (const auto & layer : layers) { if (layer.engram_embd) { ++expected; } }
++            for (const auto & named : tensors_by_name) {
++                const auto * t = named.second;
++                if (!b70_sparse_metadata(t)) { continue; }
++                const auto & weight = ml.require_weight(named.first.c_str());
++                if (!t->data || !t->buffer || mapped_bufs.count(t->buffer) != 1 ||
++                        !ggml_backend_buffer_is_host(t->buffer) ||
++                        ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
++                        t->data != static_cast<char *>(ml.mappings.at(weight.idx)->addr()) + weight.offs ||
++                        ggml_nbytes(t) != ggml_nbytes(weight.tensor)) {
++                    throw std::runtime_error("B70 sparse table is not its exact native GGUF mapping");
++                }
++                auto record = std::make_unique<llama_b70_sparse_rows>(t, ml.files.at(weight.idx)->file_id(),
++                    pimpl->b70_files.at(weight.idx), weight.offs);
++                if (!pimpl->b70_sparse.emplace(t, std::move(record)).second) {
++                    throw std::runtime_error("Duplicate native B70 sparse table");
++                }
++            }
++            if (pimpl->b70_sparse.size() != expected || expected < 2 || expected > 9) {
++                throw std::runtime_error("Native B70 sparse table catalog is incomplete");
++            }
++        }
++
+     }
+     ml.tensor_buft_overrides = original_tensor_buft_overrides;
+ 
+@@ -9067,6 +9111,14 @@
+ 
+ bool llama_model::b70_buffer_stream_enabled() const noexcept {
+     return params.b70_buffer_stream;
++}
++bool llama_model::has_b70_sparse_source(const ggml_tensor * tensor) const noexcept {
++    return params.b70_buffer_stream && arch == LLM_ARCH_DEEPSEEK41 && tensor && pimpl->b70_sparse.count(tensor) == 1;
++}
++void llama_model::read_b70_sparse_rows(const ggml_tensor * tensor, const int32_t * rows, size_t count,
++                                      std::vector<unsigned char> & bytes) const {
++    if (!has_b70_sparse_source(tensor)) { throw std::runtime_error("Unadmitted B70 sparse table"); }
++    pimpl->b70_sparse.at(tensor)->read(rows, count, bytes);
+ }
+ bool llama_model::has_b70_expert_catalog() const noexcept {
+     return params.b70_buffer_stream&&!pimpl->b70_experts.empty();
+diff --git a/engine/src/llama-model.h b/engine/src/llama-model.h
+--- a/engine/src/llama-model.h
++++ b/engine/src/llama-model.h
+@@ -693,6 +693,8 @@
+     // whether a weight's bytes are the model's file mapping (mmap): reading them brings file pages into the page cache
+     bool file_mapped(const ggml_tensor * t) const;
+     bool b70_buffer_stream_enabled() const noexcept;
++    bool has_b70_sparse_source(const ggml_tensor * tensor) const noexcept;
++    void read_b70_sparse_rows(const ggml_tensor * tensor, const int32_t * rows, size_t count, std::vector<unsigned char> & bytes) const;
+     bool has_b70_expert_catalog() const noexcept;
+     bool validate_b70_expert(const ggml_tensor * tensor,int fd,uint64_t offset,
+                              size_t stride,int64_t experts,int expert) const noexcept;
+diff --git a/engine/src/llama.cpp b/engine/src/llama.cpp
+--- a/engine/src/llama.cpp
++++ b/engine/src/llama.cpp
+@@ -147,7 +147,7 @@
+             if (!params.defer_experts || !params.use_mmap || params.use_direct_io || params.use_mlock ||
+                     params.check_tensors || params.use_extra_bufts || params.no_alloc || params.vocab_only ||
+                     !params.no_host || model.hparams.n_expert < 2 ||
+-                    (model.arch != LLM_ARCH_LLAMA && model.arch != LLM_ARCH_OPENAI_MOE && model.arch != LLM_ARCH_QWEN3NEXT)) {
++                    (model.arch != LLM_ARCH_LLAMA && model.arch != LLM_ARCH_OPENAI_MOE && model.arch != LLM_ARCH_QWEN3NEXT && model.arch != LLM_ARCH_DEEPSEEK41)) {
+                 throw std::runtime_error("Model architecture/parameters lack explicit B70 transport admission");
+             }
+             if (!params.devices || !params.devices[0] || params.devices[1] ||
+@@ -167,6 +167,11 @@
+                     !ggml_backend_reg_get_proc_address(registry,"ggml_backend_vk_buffer_memory_query_v1") ||
+                     !ggml_backend_reg_get_proc_address(registry,"ggml_backend_vk_alloc_bounded_v1")) {
+                 throw std::runtime_error("B70 model selected a different device/backend or incompatible private memory interface; no fallback");
++            }
++            if (model.arch == LLM_ARCH_DEEPSEEK41 &&
++                    (model.hparams.engram_e4m3_e8m0_32_row264 || model.hparams.engram_key_length != 256 ||
++                     (model.hparams.engram_max_ngram_size-1)*model.hparams.engram_n_head != 24)) {
++                throw std::runtime_error("DeepSeek B70 supports only native Q8 Engram row transport");
+             }
+             ml.b70_defer_weight_only = true;
+         }
+diff --git a/engine/src/models/deepseek41.cpp b/engine/src/models/deepseek41.cpp
+--- a/engine/src/models/deepseek41.cpp
++++ b/engine/src/models/deepseek41.cpp
+@@ -3,6 +3,7 @@
+ #include "deepseek41-candidate.h"
+ 
+ #include "llama-engram.h"
++#include "b70-deepseek-tail-rope.h"
+ #include "llama-impl.h"
+ #include "llama-kv-cache-dsv4.h"
+ 
+@@ -212,10 +213,12 @@
+     bool can_reuse(const llm_graph_params & params) override {
+         mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx)->get_raw();
+         const int64_t n_cols = (model.hparams.engram_max_ngram_size - 1) * model.hparams.engram_n_head;
+-        return rows->ne[0] == n_cols * params.ubatch.n_tokens;
++        return rows->ne[0] == n_cols * params.ubatch.n_tokens && (!packed || packed->ne[1] == n_cols * params.ubatch.n_tokens);
+     }
+ 
+     ggml_tensor * rows = nullptr;   // I32 [n_cols * n_tokens]
++    ggml_tensor * packed = nullptr; // private B70 compact encoded GPU input
++    std::vector<unsigned char> encoded;
+ 
+     const llama_model & model;
+ 
+@@ -293,6 +296,16 @@
+         dsv41_engram_prefetch_rows(model.layers[hp.engram_layer_ids[eg]].engram_embd, idx);
+     }
+ 
++    if (packed) {
++        const auto * source = model.layers[hp.engram_layer_ids[eg]].engram_embd;
++        if (packed->ne[1] != int64_t(idx.size()) || packed->type != GGML_TYPE_Q8_0) {
++            throw std::runtime_error("B70 sparse Engram input shape changed");
++        }
++        model.read_b70_sparse_rows(source, idx.data(), idx.size(), encoded);
++        if (encoded.size() != ggml_nbytes(packed)) { throw std::runtime_error("B70 sparse Engram byte count differs"); }
++        ggml_backend_tensor_set(packed, encoded.data(), 0, encoded.size());
++        for (size_t i = 0; i < idx.size(); ++i) { idx[i] = int32_t(i); }
++    }
+     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+ }
+ 
+@@ -394,7 +407,7 @@
+ 
+     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
+     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
+-    ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
++    ggml_tensor * mixes = build_b70_matmul( hc_fn, flat_norm);
+     cb(mixes, "hc_mixes", il);
+ 
+     ggml_tensor * scale_pre  = dsv41_view_1d(ctx0, hc_scale, 1, 0);
+@@ -477,6 +490,15 @@
+     inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cols * n_tokens);
+     ggml_set_input(inp->rows);
+     ggml_tensor * rows = inp->rows;
++    ggml_tensor * sparse = nullptr;
++    if (model.b70_buffer_stream_enabled()) {
++        if (hparams.engram_e4m3_e8m0_32_row264 || key_len != 256 || n_cols != 24 || n_tokens <= 0 || n_tokens > 32 ||
++                !model.has_b70_sparse_source(model.layers[il].engram_embd)) {
++            throw std::runtime_error("Unadmitted B70 Engram source/shape/encoding");
++        }
++        inp->packed = ggml_new_tensor_2d(ctx0, GGML_TYPE_Q8_0, key_len, n_cols*n_tokens);
++        ggml_set_input(inp->packed);sparse = inp->packed;
++    }
+     res->add_input(std::move(inp));
+ 
+     // gather then flatten, laying the buckets out slowest, as the reference does
+@@ -488,7 +510,7 @@
+         ggml_backend_sched_set_tensor_backend(sched, rows, backend_cpu);
+         ggml_backend_sched_set_tensor_backend(sched, emb, backend_cpu);
+     } else {
+-        emb = ggml_get_rows(ctx0, model.layers[il].engram_embd, rows);
++        emb = ggml_get_rows(ctx0, sparse ? sparse : model.layers[il].engram_embd, rows);
+     }
+     emb = ggml_reshape_2d(ctx0, emb, key_len * n_cols, n_tokens);
+     cb(emb, "engram_embd", il);
+@@ -601,7 +623,7 @@
+     comp = ggml_rope_ext(ctx0, comp, comp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig,
+             hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
+             dsv41_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+-    comp = ggml_rope_set_offset(comp, n_embd_head_nope);
++    comp = b70_deepseek_set_rope_offset(ctx0, comp, n_embd_head_nope, model.b70_buffer_stream_enabled());
+     cb(comp, name, il);
+ 
+     return comp;
+@@ -696,7 +718,7 @@
+     out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
+     out = ggml_rope_ext_back(ctx0, out, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
+             rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
+-    out = ggml_rope_set_offset(out, n_embd_head_nope);
++    out = b70_deepseek_set_rope_offset(ctx0, out, n_embd_head_nope, model.b70_buffer_stream_enabled());
+     cb(out, "attn_derope", il);
+ 
+     out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, nt);
+@@ -705,7 +727,7 @@
+     // the loader keeps wo_a as the file stores it, (o_group_dim, o_lora_rank * n_groups)
+     ggml_tensor * wo_a = ggml_reshape_3d(ctx0, layer.wo_a, layer.wo_a->ne[0], o_lora_rank, n_groups);
+ 
+-    ggml_tensor * oa = ggml_mul_mat(ctx0, wo_a, out);
++    ggml_tensor * oa = build_b70_matmul( wo_a, out);
+     cb(oa, "attn_wo_a", il);
+ 
+     oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
+@@ -758,7 +780,7 @@
+     idx_q = ggml_rope_ext(ctx0, idx_q, inp_pos, nullptr, n_idx_head_rope, rope_type, n_ctx_orig,
+             hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
+             dsv41_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+-    idx_q = ggml_rope_set_offset(idx_q, n_idx_head_nope);
++    idx_q = b70_deepseek_set_rope_offset(ctx0, idx_q, n_idx_head_nope, model.b70_buffer_stream_enabled());
+     cb(idx_q, "idx_q", il);
+ 
+     ggml_tensor * idx_k_rot = inp_dsv4->get_lid().k_rot;
+@@ -813,7 +835,7 @@
+         q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+         ggml_tensor * k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
+ 
+-        ggml_tensor * score = ggml_mul_mat(ctx0, k, q);
++        ggml_tensor * score = build_b70_matmul( k, q);
+         score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+ 
+         score = ggml_relu(ctx0, score);
+@@ -927,7 +949,7 @@
+     q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
+     q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
+             rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
+-    q = ggml_rope_set_offset(q, n_embd_head - n_embd_head_rope);
++    q = b70_deepseek_set_rope_offset(ctx0, q, n_embd_head - n_embd_head_rope, model.b70_buffer_stream_enabled());
+     cb(q, "q", il);
+ 
+     // the sliding window KV, which every layer keeps for itself
+@@ -936,7 +958,7 @@
+     kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt);
+     kv = ggml_rope_ext(ctx0, kv, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
+             rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
+-    kv = ggml_rope_set_offset(kv, n_embd_head - n_embd_head_rope);
++    kv = b70_deepseek_set_rope_offset(ctx0, kv, n_embd_head - n_embd_head_rope, model.b70_buffer_stream_enabled());
+     cb(kv, "kv", il);
+ 
+     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
+@@ -1009,7 +1031,7 @@
+             idx_k = ggml_rope_ext(ctx0, idx_k, inp_comp.state_write_pos, nullptr, n_idx_head_rope,
+                     rope_type, n_ctx_orig, hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
+                     dsv41_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+-            idx_k = ggml_rope_set_offset(idx_k, n_idx_head_dim - n_idx_head_rope);
++            idx_k = b70_deepseek_set_rope_offset(ctx0, idx_k, n_idx_head_dim - n_idx_head_rope, model.b70_buffer_stream_enabled());
+             cb(idx_k, "idx_k_new", il);
+ 
+             if (inp_dsv4->get_lid().k_rot) {
+@@ -1125,10 +1147,10 @@
+     llm_graph_context(params), model(model) {
+     ggml_tensor * cur;
+ 
+-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
++    ggml_tensor * inp = build_inp_embd(model.tok_embd, model);
+     ggml_tensor * inp_pos = build_inp_pos();
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+-    llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
++    llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4(model.b70_buffer_stream_enabled());
+     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
+     ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
+ 
+@@ -1251,7 +1273,7 @@
+     cb(cur, "result_norm", -1);
+     res->t_embd = cur;
+ 
+-    cur = ggml_mul_mat(ctx0, model.output, cur);
++    cur = build_b70_matmul( model.output, cur);
+     cb(cur, "result_output", -1);
+     res->t_logits = cur;
+ 

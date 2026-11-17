@@ -1,0 +1,69 @@
+{
+  "captured_utc": "2026-11-17T17:56:35.0149564Z",
+  "windows": {
+    "Caption": "Microsoft Windows 10 Education",
+    "Version": "10.0.19045",
+    "BuildNumber": "19045",
+    "OSArchitecture": "64-bit"
+  },
+  "cpu": {
+    "Name": "Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz",
+    "NumberOfCores": 6,
+    "NumberOfLogicalProcessors": 12
+  },
+  "motherboard": {
+    "Manufacturer": "Micro-Star International Co., Ltd.",
+    "Product": "Z390-A PRO (MS-7B98)"
+  },
+  "memory": [
+    {
+      "Capacity": 34359738368,
+      "ConfiguredClockSpeed": 3200
+    },
+    {
+      "Capacity": 34359738368,
+      "ConfiguredClockSpeed": 3200
+    }
+  ],
+  "gpus": [
+    {
+      "Name": "Intel(R) UHD Graphics 630",
+      "DriverVersion": "24.20.100.6345",
+      "DriverDate": "2018-09-13T19:00:00-05:00"
+    },
+    {
+      "Name": "Intel(R) Arc(TM) Pro B70 Graphics",
+      "DriverVersion": "32.0.101.8976",
+      "DriverDate": "2026-08-27T19:00:00-05:00"
+    }
+  ],
+  "storage": [
+    {
+      "Model": "CT1000BX500SSD1",
+      "Size": 1000202273280,
+      "InterfaceType": "IDE"
+    },
+    {
+      "Model": "TEAM TM8PS7512G",
+      "Size": 512105932800,
+      "InterfaceType": "IDE"
+    },
+    {
+      "Model": "T-FORCE TM8FGQ004T",
+      "Size": 4096798110720,
+      "InterfaceType": "SCSI"
+    },
+    {
+      "Model": "WD Blue SN570 1TB",
+      "Size": 1000202273280,
+      "InterfaceType": "SCSI"
+    }
+  ],
+  "windows_build": {
+    "ProductName": "Windows 10 Education",
+    "EditionID": "Education",
+    "DisplayVersion": "22H2",
+    "CurrentBuildNumber": "19045",
+    "UBR": 6456
+  }
+}
