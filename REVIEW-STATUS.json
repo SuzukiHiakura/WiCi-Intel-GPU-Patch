@@ -4,7 +4,7 @@
   "functional_on_tested_intel_b70": true,
   "recipe_benchmarks_completed": 2,
   "local_output_cap": 512,
-  "publication_approved": false,
+  "publication_approved": true,
   "release_scope": "backend source patches, functional proof, examples and measurements",
   "clean_public_rebuild_performed": false
 }
